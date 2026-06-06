@@ -1,7 +1,7 @@
 import type { SaveData, Player } from './types';
 
 const SAVE_KEY = 'the-gnar-save';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 export const DEFAULT_PLAYER: Player = {
   name: 'Skater',
@@ -26,6 +26,8 @@ export const DEFAULT_PLAYER: Player = {
   unlockedLevels: ['seattle'],
   completedChallenges: [],
   cityCredits: {},
+  rivalsBeaten: [],
+  collectibles: [],
 };
 
 export function saveGame(player: Player): void {

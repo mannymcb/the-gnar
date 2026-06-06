@@ -97,6 +97,28 @@ export function usePlayer() {
     });
   }, [updatePlayer]);
 
+  const beatRival = useCallback((levelId: string) => {
+    updatePlayer(p => {
+      if (p.rivalsBeaten.includes(levelId)) return p;
+      return { ...p, rivalsBeaten: [...p.rivalsBeaten, levelId] };
+    });
+  }, [updatePlayer]);
+
+  const unlockCollectible = useCallback((collectibleId: string) => {
+    updatePlayer(p => {
+      if (p.collectibles.includes(collectibleId)) return p;
+      return { ...p, collectibles: [...p.collectibles, collectibleId] };
+    });
+  }, [updatePlayer]);
+
+  const updateBestScore = useCallback((levelId: string, score: number) => {
+    updatePlayer(p => {
+      const current = p.cityCredits[levelId] ?? 0;
+      if (score <= current) return p;
+      return { ...p, cityCredits: { ...p.cityCredits, [levelId]: score } };
+    });
+  }, [updatePlayer]);
+
   const resetGame = useCallback(() => {
     const fresh = { ...DEFAULT_PLAYER };
     saveGame(fresh);
@@ -114,6 +136,9 @@ export function usePlayer() {
     unlockLevel,
     unlockNextLevel,
     unlockTrick,
+    beatRival,
+    unlockCollectible,
+    updateBestScore,
     resetGame,
   };
 }

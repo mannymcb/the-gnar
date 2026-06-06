@@ -40,7 +40,9 @@ export interface Player {
   unlockedTricks: string[];
   unlockedLevels: string[];
   completedChallenges: string[];
-  cityCredits: Record<string, number>;
+  cityCredits: Record<string, number>;      // best score per city
+  rivalsBeaten: string[];                   // level ids of beaten rivals
+  collectibles: string[];                   // collectible ids owned
 }
 
 // ─── LEVELS ────────────────────────────────────────────────────────────────
@@ -52,6 +54,24 @@ export interface Challenge {
   target: string | number;
   reward: { cash: number; xp: number };
   completed: boolean;
+}
+
+export interface Rival {
+  name: string;        // "The Rain King"
+  nickname: string;    // how they're known on the streets
+  score: number;       // score to beat
+  avatar: string;      // emoji representing them
+  taunts: string[];    // 1-2 lines before the run
+  defeats: string[];   // 1-2 lines after you beat them
+  lossLines: string[]; // 1-2 lines if you lose
+}
+
+export interface Collectible {
+  id: string;
+  name: string;        // "Westlake Parking Block Sticker"
+  emoji: string;
+  description: string; // short flavour text
+  unlockCondition: string; // display string e.g. "Beat the local rival"
 }
 
 export interface Level {
@@ -70,6 +90,8 @@ export interface Level {
     accent: string;
   };
   obstacles: ObstacleConfig[];
+  rival: Rival;
+  collectible: Collectible;
 }
 
 export interface ObstacleConfig {

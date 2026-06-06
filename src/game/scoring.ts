@@ -1,117 +1,126 @@
-import type { Trick, TrickResult, Player, SessionState } from './types';
-import { getEquipmentBonus } from './save';
+/**
+ * THE GNAR – Simple Arcade Scoring
+ *
+ * Do tricks → land clean → build combo → score more.
+ * No hidden modifiers. No complexity.
+ */
+import type { Trick, TrickResult } from './types';
 
-const LANDING_WINDOWS = {
-  perfect: { min: 0.85, max: 1.0 },
-  clean:   { min: 0.55, max: 0.85 },
-  sloppy:  { min: 0.25, max: 0.55 },
-  bail:    { min: 0.0,  max: 0.25 },
+// ─── BASE POINTS BY CATEGORY ─────────────────────────────────────────────────
+// These are the canonical values. tricks.ts points field is still used for
+// display purposes but the real score comes from here.
+const BASE: Record<string, number> = {
+  ollie:   100,
+  manual:  150,
+  flip:    250,
+  grind:   300,
+  gap:     400,
 };
 
-export function getLandingQuality(tapAccuracy: number): TrickResult['landingQuality'] {
-  if (tapAccuracy >= LANDING_WINDOWS.perfect.min) return 'perfect';
-  if (tapAccuracy >= LANDING_WINDOWS.clean.min) return 'clean';
-  if (tapAccuracy >= LANDING_WINDOWS.sloppy.min) return 'sloppy';
-  return 'bail';
+export function getTrickBase(trick: Trick): number {
+  // Named tricks that deserve individual values
+  const named: Record<string, number> = {
+    'ollie':          100,
+    'pop-shove-it':   150,
+    'manual':         150,
+    'kickflip':       250,
+    'heelflip':       250,
+    'nosegrind':      300,
+    'varial-flip':    350,
+    'hardflip':       350,
+    'fs-flip':        350,
+    'tre-flip':       400,
+    'bigspin':        400,
+    'crooked-grind':  400,
+    'nollie-flip':    400,
+    'inward-heel':    450,
+    'laser-flip':     500,
+  };
+  return named[trick.id] ?? BASE[trick.category] ?? 200;
 }
 
-export function calculateTrickScore(
-  trick: Trick,
-  landingQuality: TrickResult['landingQuality'],
-  session: SessionState,
-  player: Player,
-  levelMultiplier: number,
-): TrickResult {
-  const eqBonus = getEquipmentBonus(player);
-
-  // Base trick value scaled by player style
-  const styleBonus = 1 + ((player.stats.style + (eqBonus.style || 0)) * 0.05);
-  let basePoints = trick.points * styleBonus;
-
-  // Landing quality multiplier
-  const landingMult = {
-    perfect: 1.5,
-    clean:   1.0,
-    sloppy:  0.5,
-    bail:    0,
-  }[landingQuality];
-
-  basePoints *= landingMult;
-
-  // Repeat trick penalty
-  let repeatPenalty = 1.0;
-  if (session.lastTrickId === trick.id) {
-    repeatPenalty = Math.max(0.3, 1.0 - session.consecutiveSameTrick * 0.2);
+// ─── LANDING MULTIPLIER ───────────────────────────────────────────────────────
+// Clean  = 100%  (tap in green zone)
+// Sketchy = 50%  (tap in yellow zone)
+// Bail   = 0     (red zone or timeout)
+export function landingMultiplier(quality: TrickResult['landingQuality']): number {
+  switch (quality) {
+    case 'perfect': return 1;   // 'perfect' = same as clean in this model
+    case 'clean':   return 1;
+    case 'sloppy':  return 0.5; // 'sloppy' = sketchy
+    case 'bail':    return 0;
   }
-  basePoints *= repeatPenalty;
+}
 
-  // Combo multiplier
-  const comboMult = session.multiplier;
+// ─── BONUSES ─────────────────────────────────────────────────────────────────
+export const BONUS_PERFECT_LANDING = 100;
+export const BONUS_GRIND_SPARK     = 100;
+export const BONUS_RUN_FINISH      = 500;
 
-  // Level difficulty multiplier
-  const total = Math.round(basePoints * comboMult * levelMultiplier);
+// ─── COMBO ───────────────────────────────────────────────────────────────────
+// Multiplier = combo count, capped at 5
+export function comboToMultiplier(combo: number): number {
+  return Math.min(combo, 5);
+}
+
+// ─── MAIN SCORE FUNCTION ─────────────────────────────────────────────────────
+export function scoreTrick(
+  trick: Trick,
+  quality: TrickResult['landingQuality'],
+  combo: number,   // combo BEFORE this trick (0-based)
+): TrickResult {
+  const base    = getTrickBase(trick);
+  const lMult   = landingMultiplier(quality);
+  const cMult   = comboToMultiplier(combo + 1); // +1 because this trick completes the chain
+  const perfect = quality === 'perfect' || quality === 'clean'; // both are "clean" in new model
+  const bonus   = perfect ? BONUS_PERFECT_LANDING : 0;
+  const total   = Math.round(base * lMult * cMult) + bonus;
 
   return {
     trick,
-    points: Math.round(basePoints),
-    multiplier: comboMult,
+    points: base,
+    multiplier: cMult,
     total,
-    landingQuality,
+    landingQuality: quality,
     timestamp: Date.now(),
   };
 }
 
-export function getNextMultiplier(
-  current: number,
-  landingQuality: TrickResult['landingQuality'],
-  player: Player,
-): number {
-  if (landingQuality === 'bail') return 1;
-  if (landingQuality === 'sloppy') return Math.max(1, current - 0.5);
-
-  const enduranceBonus = player.stats.endurance * 0.05;
-  const increment = landingQuality === 'perfect' ? 0.5 + enduranceBonus : 0.25 + enduranceBonus;
-  return Math.min(10, current + increment);
-}
-
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 export function formatScore(score: number): string {
   if (score >= 1_000_000) return `${(score / 1_000_000).toFixed(1)}M`;
-  if (score >= 1_000) return `${(score / 1_000).toFixed(1)}K`;
+  if (score >= 1_000)     return `${(score / 1_000).toFixed(1)}K`;
   return score.toString();
 }
 
-export function getLetterGrade(score: number, levelMultiplier: number): string {
-  const normalized = score / levelMultiplier;
-  if (normalized >= 20000) return 'S';
-  if (normalized >= 12000) return 'A';
-  if (normalized >= 7000)  return 'B';
-  if (normalized >= 3000)  return 'C';
-  if (normalized >= 1000)  return 'D';
+export function getLetterGrade(score: number): string {
+  if (score >= 15000) return 'S';
+  if (score >= 8000)  return 'A';
+  if (score >= 4000)  return 'B';
+  if (score >= 1500)  return 'C';
+  if (score >= 500)   return 'D';
   return 'F';
 }
 
 export function getGradeColor(grade: string): string {
-  const colors: Record<string, string> = {
-    S: '#FFD700',
-    A: '#00ff88',
-    B: '#5bc0eb',
-    C: '#ffffff',
-    D: '#888',
-    F: '#e94560',
+  const c: Record<string, string> = {
+    S: '#FFD700', A: '#00ff88', B: '#5bc0eb',
+    C: '#ffffff', D: '#888',    F: '#e94560',
   };
-  return colors[grade] ?? '#ffffff';
+  return c[grade] ?? '#fff';
 }
 
-// How long a manual can last based on balance stat
-export function getManualDuration(player: Player): number {
-  const eqBonus = getEquipmentBonus(player);
-  const balance = player.stats.balance + (eqBonus.balance || 0);
-  return 2000 + balance * 400; // ms
-}
+// Legacy shim – SkateRun calls getNextMultiplier in a couple spots.
+// With the new model, multiplier is purely derived from combo count.
+// This just returns 1 so callers don't crash; actual mult is recalculated
+// from g.combo each time scoreTrick is called.
+export function getNextMultiplier(): number { return 1; }
 
-// Landing window size (bigger = more forgiving)
-export function getLandingWindowSize(player: Player): number {
-  const eqBonus = getEquipmentBonus(player);
-  const balance = player.stats.balance + (eqBonus.balance || 0);
-  return 0.3 + balance * 0.04; // 0.0–1.0 normalized window size
+// Legacy shim – kept so RunResults/SpotDetail imports don't break.
+export function calculateTrickScore(
+  trick: Trick,
+  quality: TrickResult['landingQuality'],
+  session: { combo: number },
+): TrickResult {
+  return scoreTrick(trick, quality, session.combo);
 }
