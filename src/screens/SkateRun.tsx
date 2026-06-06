@@ -12,66 +12,84 @@ interface Props {
   onBack: () => void;
 }
 
-// ─── GAME CONSTANTS ──────────────────────────────────────────────────────────
-const RUN_DURATION = 60;
-const GROUND_Y_RATIO = 0.72;       // ground line as fraction of canvas height
-const SKATER_X = 0.28;             // skater fixed at 28% from left
-const SCROLL_SPEED = 2.8;          // px per frame base world scroll
-const OBSTACLE_SPACING = 420;      // px between obstacles in world space
-const GRAVITY = 0.55;
-const JUMP_FORCE = -13;
-const TRICK_ROTATION_SPEED = 18;   // deg per frame for flip tricks
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const RUN_DURATION   = 60;
+const MAX_BAILS      = 3;
+const GROUND_RATIO   = 0.70;   // ground Y as fraction of canvas H
+const SKATER_FRAC    = 0.28;   // skater fixed screen-X fraction
+const BASE_SCROLL    = 2.6;    // world scroll px/frame
+const OBS_SPACING    = 440;    // world px between obstacles
+const OBS_FIRST      = 320;    // world X of first obstacle
+const GRAVITY        = 0.52;
+const JUMP_VY        = -12.5;  // initial jump velocity (upward = negative)
+const FLIP_RPM       = 16;     // board rotation deg/frame during flip tricks
+const BAIL_FRAMES    = 55;     // frames to stay in bail pose before auto-reset
+const TAP_WINDOW_MS  = 900;    // total landing window in ms
+const GRIND_PTS_TICK = 8;      // points per frame while grinding
+const GRIND_MULT     = 1.5;    // score multiplier while grinding
 
-// ─── TYPES ───────────────────────────────────────────────────────────────────
+// ─── STATE MACHINE ────────────────────────────────────────────────────────────
+// Skater FSM:
+//   rolling → (swipe up/left/right) → airborne → (tap) → rolling | bail
+//   rolling → (swipe down)          → manual   → (auto timeout) → rolling
+//   rolling → (hold near obstacle)  → grinding → (obstacle end) → rolling
+//   rolling/airborne/grinding/manual → (miss tap or timeout) → bail → rolling
+
+type TrickPhase = 'rolling' | 'airborne' | 'grinding' | 'manual' | 'bail_anim';
+
+interface Obstacle {
+  type: 'ledge' | 'rail' | 'gap' | 'block' | 'stairs' | 'bank';
+  worldX: number;
+  w: number; h: number;
+  label: string;
+  grindable: boolean;
+  scored: boolean;   // grind score already given
+}
+
 interface Particle {
-  x: number; y: number; vx: number; vy: number;
+  x: number; y: number;
+  vx: number; vy: number;
   life: number; maxLife: number;
-  color: string; size: number; type: 'spark' | 'dust' | 'star';
+  color: string; r: number;
+  type: 'dust' | 'spark';
 }
 
 interface FloatText {
   x: number; y: number; vy: number;
   text: string; color: string; size: number;
-  life: number; maxLife: number; alpha: number;
+  life: number; maxLife: number;
 }
 
-interface ObstacleWorld {
-  type: 'ledge' | 'rail' | 'gap' | 'block' | 'stairs' | 'bank';
-  worldX: number;   // position in scrolling world
-  width: number;
-  height: number;
-  label: string;
-  color: string;
-  topColor: string;
-  passed: boolean;
-  grindable: boolean;
-}
-
-interface GameState {
-  // timing
+// Everything mutable lives here — no React state in the hot path
+interface GS {
+  // meta
   running: boolean;
   timeLeft: number;
-  phase: 'idle' | 'running' | 'finished';
+  frameCount: number;
   // world
   worldOffset: number;
-  // skater physics
-  skaterY: number;      // offset from ground (positive = up)
-  skaterVY: number;
+  // physics
+  skaterY: number;      // px above ground line (0 = on ground)
+  skaterVY: number;     // px/frame, positive = falling
   onGround: boolean;
-  // trick state
-  trickPhase: 'none' | 'airborne' | 'grind' | 'manual' | 'bail';
-  currentTrickId: string | null;
-  boardRotation: number;   // degrees
-  bodyRotation: number;
-  airTime: number;
+  // FSM
+  phase: TrickPhase;
+  bailFrames: number;   // countdown to auto-recover from bail
+  currentTrick: string | null;
+  boardRot: number;     // degrees, for flip anim
+  bodyTilt: number;     // body lean in air
+  airFrames: number;    // frames in air
+  // landing window
+  tapOpen: boolean;
+  tapStart: number;     // Date.now() when window opened
+  tapProgress: number;  // 0→1 as window fills
   // grind
-  grindObstacleIdx: number;
-  grindProgress: number;   // 0..1
-  // landing
-  awaitingTap: boolean;
-  tapWindowStart: number;
-  tapWindowDuration: number;
-  tapProgress: number;     // 0..1
+  grindIdx: number;     // obstacle index being ground (-1 = none)
+  grindFrames: number;  // how long we've been grinding
+  sparkTimer: number;   // frame counter for spark emission
+  // manual
+  manualBalance: number; // −1…1 drift
+  manualFrames: number;
   // scoring
   score: number;
   combo: number;
@@ -80,566 +98,405 @@ interface GameState {
   consecutiveSame: number;
   trickHistory: TrickResult[];
   bails: number;
-  // animation
-  walkFrame: number;
-  frameCount: number;
   // feedback
-  shakeX: number; shakeY: number; shakeFrames: number;
-  manualBalance: number;   // -1..1 wobble
-  manualFrames: number;
-  grindSparkTimer: number;
+  shakeX: number; shakeY: number; shakeTTL: number;
+  walkFrame: number;
 }
 
-// ─── OBSTACLE FACTORY ────────────────────────────────────────────────────────
-function makeObstacles(level: Level): ObstacleWorld[] {
-  const configs = level.obstacles;
-  return configs.map((cfg, i) => {
-    const base: Partial<ObstacleWorld> = {
-      type: cfg.type, label: cfg.label, passed: false,
-      worldX: 300 + i * OBSTACLE_SPACING,
-    };
+function makeGS(): GS {
+  return {
+    running: false, timeLeft: RUN_DURATION, frameCount: 0,
+    worldOffset: 0,
+    skaterY: 0, skaterVY: 0, onGround: true,
+    phase: 'rolling', bailFrames: 0,
+    currentTrick: null, boardRot: 0, bodyTilt: 0, airFrames: 0,
+    tapOpen: false, tapStart: 0, tapProgress: 0,
+    grindIdx: -1, grindFrames: 0, sparkTimer: 0,
+    manualBalance: 0, manualFrames: 0,
+    score: 0, combo: 0, multiplier: 1,
+    lastTrickId: null, consecutiveSame: 0,
+    trickHistory: [], bails: 0,
+    shakeX: 0, shakeY: 0, shakeTTL: 0,
+    walkFrame: 0,
+  };
+}
+
+function makeObstacles(level: Level): Obstacle[] {
+  return level.obstacles.map((cfg, i) => {
+    const base = { type: cfg.type, worldX: OBS_FIRST + i * OBS_SPACING, label: cfg.label, scored: false };
     switch (cfg.type) {
-      case 'ledge':  return { ...base, width: 110, height: 18, color: '#8899aa', topColor: '#aabbcc', grindable: true } as ObstacleWorld;
-      case 'rail':   return { ...base, width: 90,  height: 6,  color: '#aaaaaa', topColor: '#dddddd', grindable: true } as ObstacleWorld;
-      case 'block':  return { ...base, width: 48,  height: 32, color: '#b0a090', topColor: '#ccbbaa', grindable: true } as ObstacleWorld;
-      case 'gap':    return { ...base, width: 60,  height: 2,  color: 'transparent', topColor: 'transparent', grindable: false } as ObstacleWorld;
-      case 'stairs': return { ...base, width: 80,  height: 40, color: '#888',    topColor: '#aaa', grindable: false } as ObstacleWorld;
-      case 'bank':   return { ...base, width: 80,  height: 44, color: '#667',    topColor: '#889', grindable: false } as ObstacleWorld;
-      default:       return { ...base, width: 80,  height: 20, color: '#888', topColor: '#aaa', grindable: false } as ObstacleWorld;
+      case 'ledge':  return { ...base, w: 120, h: 18, grindable: true  };
+      case 'rail':   return { ...base, w: 100, h:  8, grindable: true  };
+      case 'block':  return { ...base, w:  50, h: 30, grindable: true  };
+      case 'gap':    return { ...base, w:  58, h:  0, grindable: false };
+      case 'stairs': return { ...base, w:  80, h: 40, grindable: false };
+      case 'bank':   return { ...base, w:  80, h: 44, grindable: false };
+      default:       return { ...base, w:  80, h: 20, grindable: false };
     }
   });
 }
 
-// ─── DRAW HELPERS ─────────────────────────────────────────────────────────────
-
-function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number, level: Level, worldOffset: number) {
+// ─── DRAW: BACKGROUND ────────────────────────────────────────────────────────
+function drawBg(ctx: CanvasRenderingContext2D, W: number, H: number, level: Level, wo: number) {
   const [sky1, sky2, sky3] = level.palette.sky;
-  const grd = ctx.createLinearGradient(0, 0, 0, h);
-  grd.addColorStop(0, sky1); grd.addColorStop(0.55, sky2); grd.addColorStop(1, sky3);
-  ctx.fillStyle = grd; ctx.fillRect(0, 0, w, h);
+  const grd = ctx.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0, sky1); grd.addColorStop(0.5, sky2); grd.addColorStop(1, sky3);
+  ctx.fillStyle = grd; ctx.fillRect(0, 0, W, H);
 
-  const groundY = h * GROUND_Y_RATIO;
+  const GY = H * GROUND_RATIO;
 
-  // ── city-specific backgrounds ─────────────────────────────────────────────
+  // Seattle rain
   if (level.id === 'seattle') {
-    // Rain streaks
-    ctx.save();
-    ctx.strokeStyle = 'rgba(180,200,255,0.10)';
-    ctx.lineWidth = 1;
-    const rainOff = (worldOffset * 2.5) % 80;
-    for (let i = 0; i < 40; i++) {
-      const rx = ((i * 53 + rainOff) % w);
-      ctx.beginPath(); ctx.moveTo(rx, 0); ctx.lineTo(rx - 8, h * 0.75); ctx.stroke();
+    ctx.save(); ctx.strokeStyle = 'rgba(160,200,255,0.09)'; ctx.lineWidth = 1;
+    const ro = (wo * 2.2) % 72;
+    for (let i = 0; i < 36; i++) {
+      const rx = ((i * 61 + ro) % W);
+      ctx.beginPath(); ctx.moveTo(rx, 0); ctx.lineTo(rx - 7, GY); ctx.stroke();
     }
     ctx.restore();
   }
 
-  // ── building silhouettes (parallax at 0.25x) ──────────────────────────────
-  const bldOff = (worldOffset * 0.25) % w;
-  const bldHeights = [0.38, 0.28, 0.44, 0.32, 0.50, 0.36, 0.42, 0.30, 0.48, 0.34, 0.40, 0.26];
-  const bldWidths  = [0.08, 0.06, 0.10, 0.07, 0.09, 0.065, 0.11, 0.075, 0.085, 0.07, 0.095, 0.06];
-
+  // Buildings (parallax 0.2×)
+  const bOff = (wo * 0.2) % W;
+  const BH = [0.40, 0.28, 0.46, 0.34, 0.52, 0.38, 0.44, 0.30, 0.50, 0.36, 0.42, 0.26];
+  const BW = [0.08, 0.065, 0.10, 0.07, 0.09, 0.06, 0.11, 0.075, 0.085, 0.07, 0.095, 0.06];
   for (let pass = 0; pass < 2; pass++) {
-    const xOff = pass === 0 ? -bldOff : w - bldOff;
-    let bx = xOff;
-    for (let i = 0; i < bldHeights.length; i++) {
-      const bw = bldWidths[i] * w;
-      const bh = bldHeights[i] * groundY;
-      const by = groundY - bh;
-
-      // building body
-      const alpha = level.id === 'sf' ? 0.55 : 0.45;
-      ctx.fillStyle = `rgba(0,0,0,${alpha})`;
-      ctx.fillRect(bx, by, bw - 2, bh);
-
-      // windows
-      if (level.id === 'sf') {
-        ctx.fillStyle = 'rgba(255,220,120,0.35)';
-      } else if (level.id === 'portland') {
-        ctx.fillStyle = 'rgba(220,80,60,0.25)';
-      } else {
-        ctx.fillStyle = 'rgba(200,220,255,0.20)';
-      }
-      for (let wy = by + 8; wy < groundY - 10; wy += 14) {
-        for (let wx2 = bx + 4; wx2 < bx + bw - 8; wx2 += 10) {
-          if ((i + Math.floor(wy / 14)) % 3 !== 0)
-            ctx.fillRect(wx2, wy, 5, 7);
-        }
-      }
+    let bx = pass === 0 ? -bOff : W - bOff;
+    for (let i = 0; i < BH.length; i++) {
+      const bw = BW[i] * W, bh = BH[i] * GY, by = GY - bh;
+      ctx.fillStyle = level.id === 'sf' ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.4)';
+      ctx.fillRect(bx, by, bw - 1, bh);
+      const wc = level.id === 'sf' ? 'rgba(255,210,100,0.30)' : level.id === 'portland' ? 'rgba(200,70,50,0.22)' : 'rgba(190,215,255,0.18)';
+      ctx.fillStyle = wc;
+      for (let wy = by + 8; wy < GY - 10; wy += 14)
+        for (let wx = bx + 4; wx < bx + bw - 8; wx += 10)
+          if ((i + Math.floor(wy / 14)) % 3 !== 0) ctx.fillRect(wx, wy, 5, 7);
       bx += bw;
     }
   }
 
-  // level-specific mid-ground details
+  // Portland bridge
   if (level.id === 'portland') {
-    // Bridge structure
-    const bridgeY = groundY * 0.62;
-    ctx.fillStyle = 'rgba(40,40,60,0.7)';
-    ctx.fillRect(0, bridgeY, w, 8);
-    // Bridge pillars
-    for (let i = 0; i < 4; i++) {
-      const px = (i / 3) * w;
-      ctx.fillRect(px - 5, bridgeY, 10, groundY - bridgeY);
-    }
-  }
-
-  if (level.id === 'sf') {
-    // Bay shimmer far right
-    const bayGrd = ctx.createLinearGradient(w * 0.6, 0, w, 0);
-    bayGrd.addColorStop(0, 'transparent');
-    bayGrd.addColorStop(1, 'rgba(100,180,255,0.12)');
-    ctx.fillStyle = bayGrd;
-    ctx.fillRect(0, groundY * 0.5, w, groundY * 0.5);
+    const by2 = GY * 0.60;
+    ctx.fillStyle = 'rgba(30,30,50,0.75)'; ctx.fillRect(0, by2, W, 9);
+    for (let i = 0; i < 5; i++) { ctx.fillRect((i / 4) * W - 5, by2, 10, GY - by2); }
   }
 }
 
-function drawGround(ctx: CanvasRenderingContext2D, w: number, h: number, level: Level, worldOffset: number) {
-  const groundY = h * GROUND_Y_RATIO;
+// ─── DRAW: GROUND ─────────────────────────────────────────────────────────────
+function drawGround(ctx: CanvasRenderingContext2D, W: number, H: number, level: Level, wo: number) {
+  const GY = H * GROUND_RATIO;
+  ctx.fillStyle = level.palette.ground; ctx.fillRect(0, GY, W, H - GY);
+  ctx.fillStyle = 'rgba(0,0,0,0.32)'; ctx.fillRect(0, GY, W, 3);
 
-  // ground fill
-  ctx.fillStyle = level.palette.ground;
-  ctx.fillRect(0, groundY, w, h - groundY);
-
-  // ground top edge / shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.35)';
-  ctx.fillRect(0, groundY, w, 3);
-
-  // scrolling pavement lines
+  // Seattle wet reflection strips
   if (level.id === 'seattle') {
-    // wet reflections
-    ctx.fillStyle = 'rgba(100,150,220,0.10)';
-    const reflOff = worldOffset % 120;
-    for (let i = 0; i < 12; i++) {
-      ctx.fillRect((i * 120 - reflOff + w) % w, groundY + 5, 60, 8);
-    }
+    ctx.fillStyle = 'rgba(90,140,210,0.08)';
+    const ro = wo % 110;
+    for (let i = 0; i < 12; i++) ctx.fillRect((i * 110 - ro + W) % W, GY + 5, 55, 9);
   }
 
-  // pavement joints
-  ctx.strokeStyle = 'rgba(0,0,0,0.18)';
-  ctx.lineWidth = 1.5;
-  const jointSpacing = level.id === 'portland' ? 55 : 80;
-  const jointOff = worldOffset % jointSpacing;
-  for (let i = 0; i < Math.ceil(w / jointSpacing) + 1; i++) {
-    const jx = i * jointSpacing - jointOff;
-    ctx.beginPath(); ctx.moveTo(jx, groundY); ctx.lineTo(jx, h); ctx.stroke();
-  }
-
-  // Portland graffiti tags on ground level
-  if (level.id === 'portland') {
-    ctx.save();
-    ctx.globalAlpha = 0.18;
-    ctx.fillStyle = '#e94560';
-    const tagOff = worldOffset * 0.6 % 300;
-    ctx.font = 'bold 22px monospace';
-    ctx.fillText('DIY', (200 - tagOff + w * 2) % w, groundY + 28);
-    ctx.fillText('SKATE', (500 - tagOff + w * 2) % w, groundY + 30);
-    ctx.restore();
+  // Pavement joints
+  ctx.strokeStyle = 'rgba(0,0,0,0.16)'; ctx.lineWidth = 1.5;
+  const jSp = level.id === 'portland' ? 50 : 78;
+  const jO = wo % jSp;
+  for (let i = 0; i <= Math.ceil(W / jSp) + 1; i++) {
+    const jx = i * jSp - jO;
+    ctx.beginPath(); ctx.moveTo(jx, GY); ctx.lineTo(jx, H); ctx.stroke();
   }
 }
 
-function drawObstacle(ctx: CanvasRenderingContext2D, obs: ObstacleWorld, screenX: number, groundY: number, _level: Level) {
-  const bx = screenX;
-  const by = groundY - obs.height;
+// ─── DRAW: OBSTACLES ──────────────────────────────────────────────────────────
+function drawObstacle(ctx: CanvasRenderingContext2D, obs: Obstacle, sx: number, GY: number, isGrinding: boolean) {
+  const { w, h, type } = obs;
+  const bx = sx, by = GY - h;
 
-  switch (obs.type) {
-    case 'ledge': {
-      // shadow
-      ctx.fillStyle = 'rgba(0,0,0,0.25)';
-      ctx.fillRect(bx + 4, groundY - obs.height + 4, obs.width, obs.height);
-      // body
-      ctx.fillStyle = obs.color;
-      ctx.fillRect(bx, by, obs.width, obs.height);
-      // top waxed surface
-      ctx.fillStyle = obs.topColor;
-      ctx.fillRect(bx, by, obs.width, 5);
-      // highlight
-      ctx.fillStyle = 'rgba(255,255,255,0.3)';
-      ctx.fillRect(bx + 2, by + 1, obs.width - 4, 2);
-      // front face darker
-      ctx.fillStyle = 'rgba(0,0,0,0.2)';
-      ctx.fillRect(bx, by + 5, 5, obs.height - 5);
+  ctx.save();
+  if (isGrinding) { ctx.shadowColor = '#FFD700'; ctx.shadowBlur = 10; }
+
+  switch (type) {
+    case 'ledge':
+    case 'block': {
+      const c = type === 'block' ? ['#b0a090','#ccbbaa'] : ['#8090a0','#a0b4c8'];
+      ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.fillRect(bx + 4, by + 4, w, h);
+      ctx.fillStyle = c[0]; ctx.fillRect(bx, by, w, h);
+      ctx.fillStyle = c[1]; ctx.fillRect(bx, by, w, 5);
+      ctx.fillStyle = 'rgba(255,255,255,0.28)'; ctx.fillRect(bx + 2, by + 1, w - 4, 2);
+      ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(bx, by + 5, 4, h - 5);
       break;
     }
     case 'rail': {
-      const railY = by;
-      // posts
-      ctx.fillStyle = '#666';
-      ctx.fillRect(bx + 10, railY + 4, 4, groundY - railY - 4);
-      ctx.fillRect(bx + obs.width - 14, railY + 4, 4, groundY - railY - 4);
-      // rail bar
-      const rGrd = ctx.createLinearGradient(0, railY, 0, railY + obs.height);
-      rGrd.addColorStop(0, '#eee'); rGrd.addColorStop(0.4, '#bbb'); rGrd.addColorStop(1, '#888');
-      ctx.fillStyle = rGrd;
-      ctx.beginPath();
-      ctx.roundRect(bx, railY, obs.width, obs.height, 3);
-      ctx.fill();
-      // shine
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillRect(bx + 4, railY + 1, obs.width - 8, 2);
-      break;
-    }
-    case 'block': {
-      ctx.fillStyle = 'rgba(0,0,0,0.2)';
-      ctx.fillRect(bx + 4, by + 4, obs.width, obs.height);
-      ctx.fillStyle = obs.color;
-      ctx.fillRect(bx, by, obs.width, obs.height);
-      ctx.fillStyle = obs.topColor;
-      ctx.fillRect(bx, by, obs.width, 6);
-      ctx.fillStyle = 'rgba(255,255,255,0.2)';
-      ctx.fillRect(bx + 2, by + 1, obs.width - 4, 2);
-      ctx.fillStyle = 'rgba(0,0,0,0.15)';
-      ctx.fillRect(bx, by + 6, 5, obs.height - 6);
+      ctx.fillStyle = '#555';
+      ctx.fillRect(bx + 8, by + h, 4, GY - by - h);
+      ctx.fillRect(bx + w - 12, by + h, 4, GY - by - h);
+      const rg = ctx.createLinearGradient(0, by, 0, by + h);
+      rg.addColorStop(0,'#eee'); rg.addColorStop(0.4,'#bbb'); rg.addColorStop(1,'#888');
+      ctx.fillStyle = rg;
+      ctx.beginPath(); ctx.roundRect(bx, by, w, h, 3); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.65)'; ctx.fillRect(bx + 4, by + 1, w - 8, 2);
       break;
     }
     case 'gap': {
-      // danger stripe marking
-      ctx.fillStyle = 'rgba(255,107,53,0.5)';
-      ctx.fillRect(bx, groundY - 2, obs.width, 3);
-      ctx.setLineDash([6, 4]);
-      ctx.strokeStyle = 'rgba(255,200,0,0.5)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(bx, groundY - 1); ctx.lineTo(bx + obs.width, groundY - 1); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,90,40,0.45)'; ctx.fillRect(bx, GY - 2, w, 3);
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = 'rgba(255,200,0,0.5)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(bx, GY - 1); ctx.lineTo(bx + w, GY - 1); ctx.stroke();
       ctx.setLineDash([]);
-      // drop shadow
-      ctx.fillStyle = 'rgba(0,0,0,0.5)';
-      ctx.fillRect(bx + 2, groundY + 2, obs.width - 4, 20);
+      ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(bx + 3, GY + 2, w - 6, 18);
       break;
     }
     case 'stairs': {
-      const steps = 5;
-      const sw = obs.width / steps;
-      const sh = obs.height / steps;
+      const steps = 5, sw = w / steps;
       for (let s = 0; s < steps; s++) {
-        const sx = bx + s * sw;
-        const sy = groundY - sh * (steps - s);
-        ctx.fillStyle = s % 2 === 0 ? obs.color : obs.topColor;
-        ctx.fillRect(sx, sy, sw, sh * (steps - s));
-        ctx.fillStyle = 'rgba(255,255,255,0.15)';
-        ctx.fillRect(sx, sy, sw, 2);
+        const sx2 = bx + s * sw, sy2 = GY - (h / steps) * (steps - s);
+        ctx.fillStyle = s % 2 === 0 ? '#888' : '#aaa';
+        ctx.fillRect(sx2, sy2, sw, GY - sy2);
+        ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(sx2, sy2, sw, 2);
       }
       break;
     }
     case 'bank': {
-      ctx.fillStyle = obs.color;
-      ctx.beginPath();
-      ctx.moveTo(bx, groundY);
-      ctx.lineTo(bx + obs.width, groundY - obs.height);
-      ctx.lineTo(bx + obs.width, groundY);
-      ctx.closePath();
-      ctx.fill();
-      // surface highlight
-      ctx.strokeStyle = obs.topColor;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(bx, groundY);
-      ctx.lineTo(bx + obs.width, groundY - obs.height);
-      ctx.stroke();
+      ctx.fillStyle = '#667';
+      ctx.beginPath(); ctx.moveTo(bx, GY); ctx.lineTo(bx + w, GY - h); ctx.lineTo(bx + w, GY); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#889'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(bx, GY); ctx.lineTo(bx + w, GY - h); ctx.stroke();
       break;
     }
   }
 
-  // obstacle label
-  ctx.save();
-  ctx.globalAlpha = 0.55;
-  ctx.fillStyle = '#fff';
-  ctx.font = '8px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(obs.label.toUpperCase(), bx + obs.width / 2, by - 5);
+  // label
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 0.5; ctx.fillStyle = '#fff'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(obs.label.toUpperCase(), bx + w / 2, by - 4);
   ctx.restore();
 }
 
-// ─── DRAW SKATER ──────────────────────────────────────────────────────────────
-function drawSkater(
-  ctx: CanvasRenderingContext2D,
-  sx: number, sy: number,   // screen center-bottom of skater
-  gs: GameState,
-  _level: Level,
-) {
+// ─── DRAW: SKATER ─────────────────────────────────────────────────────────────
+function drawSkater(ctx: CanvasRenderingContext2D, sx: number, sy: number, gs: GS) {
   ctx.save();
   ctx.translate(sx, sy);
 
-  const phase = gs.trickPhase;
-  const boardRot = gs.boardRotation;
-  const bodyRot  = gs.bodyRotation;
-  const walk = gs.walkFrame;
-  const isBail = phase === 'bail';
-  const isGrind = phase === 'grind';
-  const isManual = phase === 'manual';
-  const isAir = phase === 'airborne';
+  const { phase, boardRot, bodyTilt, walkFrame } = gs;
+  const isAir   = phase === 'airborne';
+  const isGrind = phase === 'grinding';
+  const isManual= phase === 'manual';
+  const isBail  = phase === 'bail_anim';
 
   // ── BOARD ─────────────────────────────────────────────────────────────────
   ctx.save();
-  if (isAir || isGrind) {
-    ctx.rotate((boardRot * Math.PI) / 180);
-  } else if (isManual) {
-    // nose manual: tilt board
-    ctx.rotate(0.22);
-  } else if (isBail) {
-    ctx.rotate((boardRot * Math.PI) / 180);
-    ctx.translate(20, 10);
-  }
+  if (isAir)    ctx.rotate((boardRot * Math.PI) / 180);
+  if (isManual) ctx.rotate(0.20);   // nose up
+  if (isBail)   { ctx.translate(18, 8); ctx.rotate((boardRot * Math.PI) / 180); }
 
-  // deck
-  const deckW = 36, deckH = 7;
-  const deckGrd = ctx.createLinearGradient(0, -deckH / 2, 0, deckH / 2);
-  deckGrd.addColorStop(0, '#d44'); deckGrd.addColorStop(0.5, '#c33'); deckGrd.addColorStop(1, '#922');
-  ctx.fillStyle = deckGrd;
-  ctx.beginPath();
-  ctx.roundRect(-deckW / 2, -deckH / 2, deckW, deckH, 3);
-  ctx.fill();
-  // grip tape
-  ctx.fillStyle = 'rgba(0,0,0,0.4)';
-  ctx.fillRect(-deckW / 2 + 2, -deckH / 2 + 1, deckW - 4, 2);
-  // deck graphic stripe
-  ctx.fillStyle = 'rgba(255,255,255,0.15)';
-  ctx.fillRect(-8, -deckH / 2 + 3, 16, 2);
+  const DW = 36, DH = 7;
+  const dg = ctx.createLinearGradient(0, -DH / 2, 0, DH / 2);
+  dg.addColorStop(0, '#d44'); dg.addColorStop(0.5, '#c33'); dg.addColorStop(1, '#922');
+  ctx.fillStyle = dg;
+  ctx.beginPath(); ctx.roundRect(-DW / 2, -DH / 2, DW, DH, 3); ctx.fill();
+  // grip
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(-DW / 2 + 2, -DH / 2 + 1, DW - 4, 2);
+  // stripe
+  ctx.fillStyle = 'rgba(255,255,255,0.14)'; ctx.fillRect(-7, -DH / 2 + 3, 14, 2);
   // trucks
   ctx.fillStyle = '#aaa';
-  ctx.fillRect(-deckW / 2 + 3, deckH / 2 - 2, 10, 4);
-  ctx.fillRect(deckW / 2 - 13, deckH / 2 - 2, 10, 4);
+  ctx.fillRect(-DW / 2 + 3, DH / 2 - 2, 9, 4);
+  ctx.fillRect(DW / 2 - 12, DH / 2 - 2, 9, 4);
   // wheels
-  ctx.fillStyle = '#ddd';
-  const wheelR = 4;
-  [[-deckW / 2 + 5, deckH / 2 + 2], [deckW / 2 - 5, deckH / 2 + 2],
-   [-deckW / 2 + 5, -deckH / 2 - 2], [deckW / 2 - 5, -deckH / 2 - 2]].forEach(([wx, wy]) => {
-    ctx.beginPath(); ctx.arc(wx, wy, wheelR, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#999'; ctx.beginPath(); ctx.arc(wx, wy, wheelR * 0.45, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ddd';
+  const wr = 4;
+  [[-DW/2+5, DH/2+2],[DW/2-5, DH/2+2],[-DW/2+5,-DH/2-2],[DW/2-5,-DH/2-2]].forEach(([wx,wy]) => {
+    ctx.fillStyle = '#ddd'; ctx.beginPath(); ctx.arc(wx, wy, wr, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#999'; ctx.beginPath(); ctx.arc(wx, wy, wr*0.45, 0, Math.PI*2); ctx.fill();
   });
-
   ctx.restore();
+
+  if (isBail) {
+    // ragdoll body
+    ctx.save(); ctx.rotate(boardRot * 0.006);
+    ctx.fillStyle = '#ffcc99'; ctx.beginPath(); ctx.arc(14, -18, 8, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#5577aa'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(6,-14); ctx.lineTo(-6,-6); ctx.lineTo(-14,-2); ctx.stroke();
+    ctx.strokeStyle = '#445';
+    ctx.beginPath(); ctx.moveTo(-6,-6); ctx.lineTo(-8,6); ctx.lineTo(4,14); ctx.stroke();
+    ctx.restore();
+    ctx.restore();
+    return;
+  }
 
   // ── BODY ──────────────────────────────────────────────────────────────────
-  if (!isBail) {
-    ctx.save();
-    if (isAir) ctx.rotate((bodyRot * Math.PI) / 180);
-    const legSwing = isAir ? 0 : Math.sin(walk * 0.18) * 4;
-    const bodyBob  = isAir ? -Math.abs(gs.skaterY) * 0.15 : Math.abs(Math.sin(walk * 0.18)) * 1.5;
+  ctx.save();
+  if (isAir) ctx.rotate((bodyTilt * Math.PI) / 180);
 
-    // board-foot leg (back)
-    ctx.strokeStyle = '#445'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(-4, -deckH / 2 - 2);
-    ctx.lineTo(-6 + legSwing, -deckH / 2 - 16);
-    ctx.lineTo(-9 + legSwing * 0.5, -deckH / 2 - 8);
-    ctx.stroke();
-    // shoe back
-    ctx.fillStyle = '#222';
-    ctx.beginPath(); ctx.ellipse(-9 + legSwing * 0.5, -deckH / 2 - 6, 6, 3, 0, 0, Math.PI * 2); ctx.fill();
+  const legSw  = isAir ? 0 : Math.sin(walkFrame * 0.18) * 4;
+  const bodyBob= isAir ? 0 : Math.abs(Math.sin(walkFrame * 0.18)) * 1.5;
+  const torsoY = -DH / 2 - 30 - bodyBob;
 
-    // front leg
-    ctx.strokeStyle = '#556';
-    ctx.beginPath();
-    ctx.moveTo(6, -deckH / 2 - 2);
-    ctx.lineTo(8 - legSwing, -deckH / 2 - 18);
-    ctx.lineTo(11 - legSwing * 0.5, -deckH / 2 - 8);
-    ctx.stroke();
-    // shoe front
-    ctx.fillStyle = '#334';
-    ctx.beginPath(); ctx.ellipse(11 - legSwing * 0.5, -deckH / 2 - 6, 6, 3, 0, 0, Math.PI * 2); ctx.fill();
+  // back leg
+  ctx.strokeStyle = '#445'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-4, -DH/2); ctx.lineTo(-6+legSw, -DH/2-14); ctx.lineTo(-10+legSw*.5, -DH/2-7); ctx.stroke();
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.ellipse(-10+legSw*.5, -DH/2-5, 6, 3, 0, 0, Math.PI*2); ctx.fill();
+  // front leg
+  ctx.strokeStyle = '#556';
+  ctx.beginPath(); ctx.moveTo(6, -DH/2); ctx.lineTo(8-legSw, -DH/2-16); ctx.lineTo(12-legSw*.5, -DH/2-7); ctx.stroke();
+  ctx.fillStyle = '#334'; ctx.beginPath(); ctx.ellipse(12-legSw*.5, -DH/2-5, 6, 3, 0, 0, Math.PI*2); ctx.fill();
 
-    const torsoTop = -deckH / 2 - 32 - bodyBob;
+  // torso
+  ctx.fillStyle = '#4466aa';
+  ctx.beginPath(); ctx.roundRect(-7, torsoY + 10, 14, 14, 3); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(-3, torsoY + 13, 6, 4);
 
-    // torso
-    ctx.fillStyle = '#5577aa';
-    ctx.beginPath();
-    ctx.roundRect(-7, torsoTop + 10, 14, 14, 3);
-    ctx.fill();
-    // logo on shirt
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
-    ctx.fillRect(-3, torsoTop + 13, 6, 4);
+  // arms
+  const armSw = isGrind ? 14 : isManual ? -10 : Math.sin(walkFrame * 0.18) * 6;
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = '#3355aa';
+  ctx.beginPath(); ctx.moveTo(-6, torsoY+14); ctx.lineTo(-14, torsoY+22+armSw); ctx.stroke();
+  ctx.strokeStyle = '#5577bb';
+  ctx.beginPath(); ctx.moveTo(6, torsoY+14); ctx.lineTo(13, torsoY+20-armSw); ctx.stroke();
 
-    // arms
-    ctx.strokeStyle = '#5577aa'; ctx.lineWidth = 4;
-    const armSwing = isGrind ? 15 : (isManual ? -10 : Math.sin(walk * 0.18) * 6);
-    // back arm
-    ctx.strokeStyle = '#4466aa';
-    ctx.beginPath();
-    ctx.moveTo(-6, torsoTop + 14);
-    ctx.lineTo(-14, torsoTop + 22 + armSwing);
-    ctx.stroke();
-    // front arm
-    ctx.strokeStyle = '#6688bb';
-    ctx.beginPath();
-    ctx.moveTo(6, torsoTop + 14);
-    ctx.lineTo(13, torsoTop + 20 - armSwing);
-    ctx.stroke();
+  // head
+  ctx.fillStyle = '#ffcc99'; ctx.beginPath(); ctx.arc(1, torsoY+5, 9, 0, Math.PI*2); ctx.fill();
+  // helmet
+  ctx.fillStyle = '#cc2222'; ctx.beginPath(); ctx.ellipse(1, torsoY+2, 9, 6, 0, Math.PI, 0); ctx.fill();
+  // shades
+  ctx.fillStyle = '#111';
+  ctx.fillRect(-6, torsoY+5, 5, 3); ctx.fillRect(1, torsoY+5, 5, 3);
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(-1, torsoY+6); ctx.lineTo(1, torsoY+6); ctx.stroke();
 
-    // head
-    ctx.fillStyle = '#ffcc99';
-    ctx.beginPath(); ctx.arc(1, torsoTop + 5, 9, 0, Math.PI * 2); ctx.fill();
-    // helmet / hat
-    ctx.fillStyle = '#cc2222';
-    ctx.beginPath(); ctx.ellipse(1, torsoTop + 2, 9, 6, 0, Math.PI, 0); ctx.fill();
-    // sunglasses
-    ctx.fillStyle = '#111';
-    ctx.fillRect(-6, torsoTop + 5, 5, 3);
-    ctx.fillRect(1, torsoTop + 5, 5, 3);
-    ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(-1, torsoTop + 6); ctx.lineTo(1, torsoTop + 6); ctx.stroke();
-
-    ctx.restore();
-  } else {
-    // BAIL — ragdoll
-    ctx.save();
-    ctx.rotate((boardRot * Math.PI) / 180 * 0.4);
-    ctx.fillStyle = '#ffcc99';
-    ctx.beginPath(); ctx.arc(16, -20, 8, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#5577aa'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(8, -16); ctx.lineTo(-4, -8); ctx.lineTo(-12, -4); ctx.stroke();
-    ctx.strokeStyle = '#445';
-    ctx.beginPath(); ctx.moveTo(-4, -8); ctx.lineTo(-6, 4); ctx.lineTo(4, 12); ctx.stroke();
-    ctx.restore();
-  }
-
+  ctx.restore();
   ctx.restore();
 }
 
-// ─── DRAW GRIND SPARKS ────────────────────────────────────────────────────────
-function spawnGrindSparks(gs: GameState, sx: number, sy: number): Particle[] {
-  if (!gs.grindSparkTimer) return [];
-  return Array.from({ length: 3 }, () => ({
-    x: sx + (Math.random() - 0.5) * 16,
-    y: sy - 4,
-    vx: (Math.random() - 0.5) * 5,
-    vy: -1 - Math.random() * 3,
-    life: 20, maxLife: 20,
-    color: Math.random() > 0.5 ? '#FFD700' : '#ff6b35',
-    size: 2 + Math.random() * 2,
-    type: 'spark' as const,
-  }));
-}
-
-// ─── DRAW PARTICLES ───────────────────────────────────────────────────────────
-function drawParticles(ctx: CanvasRenderingContext2D, particles: Particle[]) {
-  for (const p of particles) {
-    const alpha = p.life / p.maxLife;
-    ctx.save();
-    ctx.globalAlpha = alpha;
+// ─── DRAW: PARTICLES ──────────────────────────────────────────────────────────
+function drawParticles(ctx: CanvasRenderingContext2D, ps: Particle[]) {
+  for (const p of ps) {
+    const a = p.life / p.maxLife;
+    ctx.save(); ctx.globalAlpha = a;
     if (p.type === 'spark') {
-      ctx.fillStyle = p.color;
-      ctx.shadowColor = p.color;
-      ctx.shadowBlur = 6;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * alpha, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (p.type === 'star') {
-      ctx.fillStyle = p.color;
-      ctx.font = `${p.size}px sans-serif`;
-      ctx.fillText('★', p.x, p.y);
+      ctx.fillStyle = p.color; ctx.shadowColor = p.color; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * a, 0, Math.PI*2); ctx.fill();
     } else {
       ctx.fillStyle = p.color;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * alpha, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * a, 0, Math.PI*2); ctx.fill();
     }
     ctx.restore();
   }
 }
 
-// ─── HUD helpers ─────────────────────────────────────────────────────────────
+// ─── DRAW: HUD ────────────────────────────────────────────────────────────────
 function drawHUD(
-  ctx: CanvasRenderingContext2D, w: number, h: number,
-  gs: GameState, _level: Level,
-  floatTexts: FloatText[], landingProgress: number, awaitingTap: boolean,
+  ctx: CanvasRenderingContext2D, W: number, H: number, gs: GS,
+  floats: FloatText[], obstacles: Obstacle[],
 ) {
-  // Score top-right
+  const GY = H * GROUND_RATIO;
   ctx.save();
-  ctx.font = 'bold 28px "Bebas Neue", Impact, sans-serif';
-  ctx.fillStyle = '#ffffff';
-  ctx.shadowColor = 'rgba(0,0,0,0.8)';
-  ctx.shadowBlur = 8;
-  ctx.textAlign = 'right';
-  ctx.fillText(formatScore(gs.score), w - 16, 44);
-  ctx.shadowBlur = 0;
+  ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 6;
 
-  // Timer top-right under score
-  const tColor = gs.timeLeft <= 10 ? '#ff4444' : 'rgba(255,255,255,0.7)';
-  ctx.font = `bold 14px monospace`;
-  ctx.fillStyle = tColor;
-  ctx.fillText(`${gs.timeLeft}s`, w - 16, 62);
+  // ── Score ─────────────────────────────────────────────────────────────────
+  ctx.textAlign = 'right'; ctx.font = 'bold 30px "Bebas Neue",Impact,sans-serif';
+  ctx.fillStyle = '#fff'; ctx.fillText(formatScore(gs.score), W - 14, 46);
 
-  // Multiplier top-center
+  // ── Timer ─────────────────────────────────────────────────────────────────
+  ctx.font = 'bold 14px monospace';
+  ctx.fillStyle = gs.timeLeft <= 10 ? '#ff4444' : 'rgba(255,255,255,0.75)';
+  ctx.fillText(`${gs.timeLeft}s`, W - 14, 64);
+
+  // ── Bail indicators (top-left) ────────────────────────────────────────────
+  ctx.textAlign = 'left'; ctx.font = '9px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.fillText('BAILS', 14, 30);
+  for (let i = 0; i < MAX_BAILS; i++) {
+    ctx.fillStyle = i < gs.bails ? '#ff4444' : 'rgba(255,255,255,0.2)';
+    ctx.beginPath(); ctx.arc(14 + 4 + i * 16, 40, 5, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ── Multiplier (top-center) ───────────────────────────────────────────────
   if (gs.multiplier > 1.05) {
     ctx.textAlign = 'center';
-    ctx.font = `bold ${gs.multiplier > 3 ? 24 : 18}px "Bebas Neue", Impact, sans-serif`;
-    ctx.fillStyle = '#FFD700';
-    ctx.shadowColor = 'rgba(255,200,0,0.6)';
-    ctx.shadowBlur = 12;
-    ctx.fillText(`x${gs.multiplier.toFixed(1)}`, w / 2, 50);
-    ctx.shadowBlur = 0;
+    ctx.font = `bold ${gs.multiplier > 4 ? 26 : 20}px "Bebas Neue",Impact,sans-serif`;
+    ctx.fillStyle = '#FFD700'; ctx.shadowColor = 'rgba(255,200,0,0.7)'; ctx.shadowBlur = 14;
+    ctx.fillText(`x${gs.multiplier.toFixed(1)}`, W / 2, 50);
+    ctx.shadowBlur = 6;
   }
 
-  // Combo chain dots bottom-left
+  // ── Combo dots (bottom-left) ──────────────────────────────────────────────
   if (gs.combo > 0) {
-    ctx.textAlign = 'left';
-    ctx.font = '10px monospace';
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText(`COMBO`, 16, h - 80);
-    const dotSize = 8, dotGap = 11;
-    for (let i = 0; i < Math.min(gs.combo, 12); i++) {
-      ctx.fillStyle = i < 4 ? '#ff6b35' : i < 8 ? '#FFD700' : '#00ff88';
-      ctx.beginPath();
-      ctx.arc(16 + i * dotGap + dotSize / 2, h - 66, dotSize / 2, 0, Math.PI * 2);
-      ctx.fill();
+    const SHOW = Math.min(gs.combo, 14);
+    ctx.textAlign = 'left'; ctx.font = '9px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillText('COMBO', 14, H - 80);
+    for (let i = 0; i < SHOW; i++) {
+      ctx.fillStyle = i < 5 ? '#ff6b35' : i < 10 ? '#FFD700' : '#00ff88';
+      ctx.beginPath(); ctx.arc(14 + 5 + i * 13, H - 65, 5, 0, Math.PI*2); ctx.fill();
     }
-    if (gs.combo > 12) {
-      ctx.fillStyle = '#fff';
-      ctx.font = '9px monospace';
-      ctx.fillText(`+${gs.combo - 12}`, 16 + 12 * dotGap + 6, h - 62);
+    if (gs.combo > 14) {
+      ctx.fillStyle = '#fff'; ctx.font = '9px monospace';
+      ctx.fillText(`+${gs.combo - 14}`, 14 + 14 * 13 + 8, H - 62);
     }
   }
 
-  // Manual balance meter
-  if (gs.trickPhase === 'manual') {
-    const mw = 100, mh = 8;
-    const mx = w / 2 - mw / 2, my = h - 55;
-    ctx.fillStyle = 'rgba(0,0,0,0.5)';
-    ctx.beginPath(); ctx.roundRect(mx, my, mw, mh, 4); ctx.fill();
-    // balance fill
-    const bal = (gs.manualBalance + 1) / 2; // 0..1
-    ctx.fillStyle = Math.abs(gs.manualBalance) > 0.6 ? '#ff4444' : '#00ff88';
-    ctx.fillRect(mx + 2, my + 2, (mw - 4) * bal, mh - 4);
-    // center line
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(mx + mw / 2 - 1, my, 2, mh);
-    ctx.textAlign = 'center';
-    ctx.font = '9px monospace';
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.fillText('MANUAL', w / 2, my - 4);
-  }
-
-  // Landing tap meter
-  if (awaitingTap) {
-    const tw = 130, th = 10;
-    const tx = w / 2 - tw / 2, ty = h * GROUND_Y_RATIO - 60;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.beginPath(); ctx.roundRect(tx - 2, ty - 2, tw + 4, th + 4, 5); ctx.fill();
+  // ── TAP LANDING WINDOW ────────────────────────────────────────────────────
+  if (gs.tapOpen) {
+    const TW = 140, TH = 12;
+    const tx = W / 2 - TW / 2, ty = GY - 68;
+    // BG
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.beginPath(); ctx.roundRect(tx - 3, ty - 3, TW + 6, TH + 6, 6); ctx.fill();
     // track
-    ctx.fillStyle = 'rgba(255,255,255,0.15)';
-    ctx.beginPath(); ctx.roundRect(tx, ty, tw, th, 4); ctx.fill();
-    // fill — green early, gold mid, red late
-    const prog = landingProgress;
-    ctx.fillStyle = prog < 0.35 ? '#00ff88' : prog < 0.65 ? '#FFD700' : '#ff4444';
-    ctx.beginPath(); ctx.roundRect(tx, ty, tw * prog, th, 4); ctx.fill();
-    // pulse label
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 10px monospace';
-    ctx.fillStyle = '#fff';
-    ctx.shadowBlur = 6; ctx.shadowColor = '#fff';
-    ctx.fillText('TAP TO LAND', w / 2, ty - 6);
-    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.beginPath(); ctx.roundRect(tx, ty, TW, TH, 4); ctx.fill();
+    // GREEN zone (0–35%)
+    ctx.fillStyle = '#00ff88';
+    ctx.beginPath(); ctx.roundRect(tx, ty, TW * 0.35, TH, 4); ctx.fill();
+    // YELLOW zone (35–65%)
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath(); ctx.roundRect(tx + TW * 0.35, ty, TW * 0.30, TH, 0); ctx.fill();
+    // RED zone (65–100%)
+    ctx.fillStyle = '#ff5544';
+    ctx.beginPath(); ctx.roundRect(tx + TW * 0.65, ty, TW * 0.35, TH, [0,4,4,0]); ctx.fill();
+    // cursor bar
+    const cPos = tx + TW * gs.tapProgress;
+    ctx.fillStyle = '#fff'; ctx.shadowColor = '#fff'; ctx.shadowBlur = 8;
+    ctx.fillRect(cPos - 2, ty - 3, 4, TH + 6);
+    ctx.shadowBlur = 6;
+    // label
+    ctx.textAlign = 'center'; ctx.font = 'bold 10px monospace';
+    ctx.fillStyle = '#fff'; ctx.shadowColor = '#000'; ctx.shadowBlur = 4;
+    ctx.fillText('TAP TO LAND', W / 2, ty - 8);
+    // quality preview
+    const qLabel = gs.tapProgress < 0.35 ? 'CLEAN' : gs.tapProgress < 0.65 ? 'SKETCHY' : 'BAIL ZONE';
+    const qColor = gs.tapProgress < 0.35 ? '#00ff88' : gs.tapProgress < 0.65 ? '#FFD700' : '#ff5544';
+    ctx.fillStyle = qColor; ctx.font = '9px monospace'; ctx.shadowBlur = 0;
+    ctx.fillText(qLabel, W / 2, ty + TH + 12);
   }
 
-  // Float texts
-  for (const ft of floatTexts) {
-    ctx.save();
-    ctx.globalAlpha = ft.alpha;
-    ctx.textAlign = 'center';
-    ctx.font = `bold ${ft.size}px "Bebas Neue", Impact, sans-serif`;
-    ctx.fillStyle = ft.color;
-    ctx.shadowColor = 'rgba(0,0,0,0.9)';
-    ctx.shadowBlur = 8;
+  // ── GRIND indicator ───────────────────────────────────────────────────────
+  if (gs.phase === 'grinding') {
+    const obs = obstacles[gs.grindIdx];
+    if (obs) {
+      ctx.textAlign = 'center'; ctx.font = 'bold 11px monospace';
+      ctx.fillStyle = '#FFD700'; ctx.shadowColor = '#FFD700'; ctx.shadowBlur = 10;
+      ctx.fillText('GRINDING +POINTS', W / 2, GY - 80);
+      ctx.shadowBlur = 6;
+    }
+  }
+
+  // ── MANUAL balance bar ────────────────────────────────────────────────────
+  if (gs.phase === 'manual') {
+    const BW2 = 100, BH = 8, bx = W / 2 - BW2 / 2, by = H - 52;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.beginPath(); ctx.roundRect(bx, by, BW2, BH, 4); ctx.fill();
+    const bal = (gs.manualBalance + 1) / 2;
+    ctx.fillStyle = Math.abs(gs.manualBalance) > 0.65 ? '#ff4444' : '#00ff88';
+    ctx.fillRect(bx + 2, by + 2, (BW2 - 4) * bal, BH - 4);
+    ctx.fillStyle = '#fff'; ctx.fillRect(bx + BW2 / 2 - 1, by, 2, BH);
+    ctx.textAlign = 'center'; ctx.font = '9px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.shadowBlur = 0;
+    ctx.fillText('MANUAL — BALANCE', W / 2, by - 5);
+  }
+
+  // ── Float texts ───────────────────────────────────────────────────────────
+  for (const ft of floats) {
+    const a = ft.life / ft.maxLife;
+    ctx.save(); ctx.globalAlpha = a; ctx.textAlign = 'center';
+    ctx.font = `bold ${ft.size}px "Bebas Neue",Impact,sans-serif`;
+    ctx.fillStyle = ft.color; ctx.shadowColor = 'rgba(0,0,0,0.95)'; ctx.shadowBlur = 10;
     ctx.fillText(ft.text, ft.x, ft.y);
     ctx.restore();
   }
@@ -647,557 +504,571 @@ function drawHUD(
   ctx.restore();
 }
 
-// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
+// ─── COMPONENT ────────────────────────────────────────────────────────────────
 export const SkateRun: React.FC<Props> = ({ level, player, levelIndex, onComplete, onBack }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const gsRef = useRef<GameState>(makeInitialGS());
-  const obstaclesRef = useRef<ObstacleWorld[]>(makeObstacles(level));
-  const particlesRef = useRef<Particle[]>([]);
-  const floatTextsRef = useRef<FloatText[]>([]);
-  const rafRef = useRef<number>(0);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const touchRef = useRef<{ startX: number; startY: number; startTime: number; moved: boolean } | null>(null);
-  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [phase, setPhase] = useState<'idle' | 'running' | 'finished'>('idle');
+  const canvasRef   = useRef<HTMLCanvasElement>(null);
+  const gs          = useRef<GS>(makeGS());
+  const obstacles   = useRef<Obstacle[]>(makeObstacles(level));
+  const particles   = useRef<Particle[]>([]);
+  const floats      = useRef<FloatText[]>([]);
+  const raf         = useRef<number>(0);
+  const timer       = useRef<ReturnType<typeof setInterval> | null>(null);
+  const touch       = useRef<{x:number;y:number;t:number;moved:boolean}|null>(null);
+  const holdTimer   = useRef<ReturnType<typeof setTimeout>|null>(null);
   const finishedRef = useRef(false);
+  const [screenPhase, setScreenPhase] = useState<'idle'|'running'|'finished'>('idle');
 
-  function makeInitialGS(): GameState {
-    return {
-      running: false, timeLeft: RUN_DURATION, phase: 'idle',
-      worldOffset: 0,
-      skaterY: 0, skaterVY: 0, onGround: true,
-      trickPhase: 'none', currentTrickId: null,
-      boardRotation: 0, bodyRotation: 0, airTime: 0,
-      grindObstacleIdx: -1, grindProgress: 0,
-      awaitingTap: false, tapWindowStart: 0, tapWindowDuration: 800, tapProgress: 0,
-      score: 0, combo: 0, multiplier: 1, lastTrickId: null, consecutiveSame: 0,
-      trickHistory: [], bails: 0,
-      walkFrame: 0, frameCount: 0,
-      shakeX: 0, shakeY: 0, shakeFrames: 0,
-      manualBalance: 0, manualFrames: 0,
-      grindSparkTimer: 0,
-    };
+  const tricks = getTricksForLevel(levelIndex).filter(t => player.unlockedTricks.includes(t.id));
+
+  function trickFor(dir: SwipeDirection, hold: boolean) {
+    const g = hold ? `hold-${dir}` as const : `swipe-${dir}` as const;
+    const cs = tricks.filter(t => t.gesture === g);
+    if (!cs.length) return null;
+    return cs.reduce((b, t) => t.unlockLevel > b.unlockLevel ? t : b, cs[0]);
   }
 
-  const availableTricks = getTricksForLevel(levelIndex).filter(t => player.unlockedTricks.includes(t.id));
-
-  function getGestureToTrick(dir: SwipeDirection, isHold: boolean) {
-    const gesture = isHold ? `hold-${dir}` as const : `swipe-${dir}` as const;
-    const candidates = availableTricks.filter(t => t.gesture === gesture);
-    if (!candidates.length) return null;
-    return candidates.reduce((best, t) => t.unlockLevel > best.unlockLevel ? t : best, candidates[0]);
+  // ── particle helpers ───────────────────────────────────────────────────────
+  function emitParticles(cx: number, cy: number, type: Particle['type'], color: string, n: number) {
+    for (let i = 0; i < n; i++) {
+      particles.current.push({
+        x: cx + (Math.random() - 0.5) * 18, y: cy,
+        vx: (Math.random() - 0.5) * 7, vy: -1.5 - Math.random() * 4.5,
+        life: 28 + Math.random() * 22, maxLife: 50,
+        color, r: 2.5 + Math.random() * 2.5, type,
+      });
+    }
   }
 
-  // ── EMIT helpers ───────────────────────────────────────────────────────────
-  function spawnLandingParticles(cx: number, cy: number, quality: string, count: number) {
-    const color = quality === 'perfect' ? '#FFD700' : quality === 'bail' ? '#ff4444' : '#ff6b35';
-    const newP: Particle[] = Array.from({ length: count }, () => ({
-      x: cx + (Math.random() - 0.5) * 20,
-      y: cy,
-      vx: (Math.random() - 0.5) * 7,
-      vy: -2 - Math.random() * 5,
-      life: 30 + Math.random() * 20, maxLife: 50,
-      color, size: 3 + Math.random() * 3,
-      type: (quality === 'perfect' ? 'star' : 'dust') as Particle['type'],
-    }));
-    particlesRef.current.push(...newP);
+  function emitSparks(cx: number, cy: number) {
+    for (let i = 0; i < 4; i++) {
+      particles.current.push({
+        x: cx + (Math.random()-0.5)*14, y: cy - 2,
+        vx: (Math.random()-0.5)*6, vy: -0.5 - Math.random()*3,
+        life: 18, maxLife: 18,
+        color: Math.random() > 0.5 ? '#FFD700' : '#ff9900',
+        r: 2 + Math.random() * 2, type: 'spark',
+      });
+    }
   }
 
-  function spawnFloatText(x: number, y: number, text: string, color: string, size: number) {
-    floatTextsRef.current.push({ x, y, vy: -1.2, text, color, size, life: 60, maxLife: 60, alpha: 1 });
+  function floatText(x: number, y: number, text: string, color: string, size: number) {
+    floats.current.push({ x, y, vy: -1.1, text, color, size, life: 70, maxLife: 70 });
   }
 
-  // ── SCORING ────────────────────────────────────────────────────────────────
-  function landTrick(trickId: string, accuracy: number, w: number, h: number) {
-    const gs = gsRef.current;
+  // ── CORE LANDING LOGIC ─────────────────────────────────────────────────────
+  const doLand = useCallback((trickId: string, tapProg: number) => {
+    const g = gs.current;
+    if (g.phase !== 'airborne') return;
+
     const trick = ALL_TRICKS.find(t => t.id === trickId);
     if (!trick) return;
 
-    const quality: TrickResult['landingQuality'] =
-      accuracy >= 0.85 ? 'perfect' : accuracy >= 0.55 ? 'clean' : accuracy >= 0.25 ? 'sloppy' : 'bail';
+    const canvas = canvasRef.current;
+    const W = canvas?.offsetWidth ?? 375, H = canvas?.offsetHeight ?? 812;
+    const GY = H * GROUND_RATIO;
+    const cx = W * SKATER_FRAC, cy = GY - g.skaterY;
 
-    const cx = w * SKATER_X;
-    const cy = h * GROUND_Y_RATIO - gs.skaterY;
+    // Quality: green zone = clean (0–0.35), yellow = sketchy (0.35–0.65), else bail
+    const quality: TrickResult['landingQuality'] =
+      tapProg <= 0.35 ? 'perfect'
+      : tapProg <= 0.65 ? 'clean'
+      : tapProg <= 0.85 ? 'sloppy'
+      : 'bail';
+
+    g.tapOpen = false; g.currentTrick = null;
 
     if (quality === 'bail') {
-      gs.trickPhase = 'bail';
-      gs.boardRotation = 90 + Math.random() * 180;
-      gs.bails++;
-      gs.multiplier = 1; gs.combo = 0;
-      gs.awaitingTap = false;
-      spawnLandingParticles(cx, cy, 'bail', 8);
-      spawnFloatText(cx, cy - 50, 'BAIL!', '#ff4444', 26);
-      setTimeout(() => {
-        gsRef.current.trickPhase = 'none';
-        gsRef.current.boardRotation = 0;
-        gsRef.current.bodyRotation = 0;
-      }, 500);
+      // BAIL — reset after animation, count against run
+      g.phase = 'bail_anim';
+      g.bailFrames = BAIL_FRAMES;
+      g.boardRot = 100 + Math.random() * 160;
+      g.bails++;
+      g.multiplier = 1; g.combo = 0;
+      emitParticles(cx, cy, 'dust', '#ff4444', 10);
+      floatText(cx, cy - 50, 'BAIL!', '#ff4444', 28);
+      floatText(cx, cy - 76, `${g.bails}/${MAX_BAILS} bails`, '#ff8866', 13);
+
+      if (g.bails >= MAX_BAILS) {
+        // end run after brief delay
+        setTimeout(() => {
+          g.running = false; g.phase = 'rolling';
+          if (!finishedRef.current) {
+            finishedRef.current = true;
+            setScreenPhase('finished');
+            setTimeout(() => onComplete(g.score, g.trickHistory), 1200);
+          }
+        }, 900);
+      }
       return;
     }
 
+    // Successful land
     const result = calculateTrickScore(trick, quality, {
-      ...gs, isComboActive: gs.combo > 0,
-      trickHistory: gs.trickHistory, bails: gs.bails, runTimeLeft: gs.timeLeft,
-      isRunning: gs.running, currentObstacleIndex: gs.grindObstacleIdx,
-      manualActive: gs.trickPhase === 'manual', grindActive: gs.trickPhase === 'grind',
-      grindProgress: gs.grindProgress, playerX: gs.worldOffset, phase: 'skating',
-      lastTrickId: gs.lastTrickId, consecutiveSameTrick: gs.consecutiveSame,
+      score: g.score, combo: g.combo, multiplier: g.multiplier,
+      trickHistory: g.trickHistory, isComboActive: g.combo > 0,
+      runTimeLeft: g.timeLeft, isRunning: g.running,
+      bails: g.bails, currentObstacleIndex: g.grindIdx,
+      manualActive: false, grindActive: false, grindProgress: 0,
+      playerX: g.worldOffset, phase: 'skating',
+      lastTrickId: g.lastTrickId, consecutiveSameTrick: g.consecutiveSame,
     }, player, level.multiplier);
 
-    const newMult = getNextMultiplier(gs.multiplier, quality, player);
+    g.score += result.total;
+    g.combo  = quality === 'sloppy' ? Math.max(0, g.combo - 1) : g.combo + 1;
+    g.multiplier = getNextMultiplier(g.multiplier, quality, player);
+    g.consecutiveSame = g.lastTrickId === trick.id ? g.consecutiveSame + 1 : 0;
+    g.lastTrickId = trick.id;
+    g.trickHistory.push(result);
+    g.phase = 'rolling'; g.boardRot = 0; g.bodyTilt = 0;
 
-    gs.score += result.total;
-    gs.combo = quality === 'sloppy' ? Math.max(0, gs.combo - 1) : gs.combo + 1;
-    gs.multiplier = newMult;
-    gs.consecutiveSame = gs.lastTrickId === trick.id ? gs.consecutiveSame + 1 : 0;
-    gs.lastTrickId = trick.id;
-    gs.trickHistory.push(result);
-    gs.trickPhase = 'none';
-    gs.awaitingTap = false;
-    gs.boardRotation = 0; gs.bodyRotation = 0;
+    const ql = quality === 'perfect' ? 'CLEAN!' : quality === 'clean' ? 'CLEAN' : 'SKETCHY';
+    const qc = quality === 'perfect' ? '#FFD700' : quality === 'clean' ? '#00ff88' : '#ffcc44';
+    if (quality === 'perfect') { g.shakeTTL = 8; emitParticles(cx, cy, 'spark', '#FFD700', 18); }
+    else emitParticles(cx, cy, 'dust', '#ff8833', 10);
 
-    spawnLandingParticles(cx, cy, quality, quality === 'perfect' ? 20 : 10);
-
-    const qualLabel = quality === 'perfect' ? 'PERFECT!' : quality === 'clean' ? 'CLEAN' : 'SLOPPY';
-    const qualColor = quality === 'perfect' ? '#FFD700' : quality === 'clean' ? '#00ff88' : '#aaa';
-    if (quality === 'perfect') gs.shakeFrames = 8;
-
-    spawnFloatText(cx, cy - 60, trick.name, '#fff', 22);
-    spawnFloatText(cx, cy - 82, qualLabel, qualColor, 14);
-    spawnFloatText(cx, cy - 100, `+${formatScore(result.total)}`, '#ff6b35', 16);
-  }
+    floatText(cx, cy - 52, trick.name.toUpperCase(), '#ffffff', 24);
+    floatText(cx, cy - 78, ql, qc, 16);
+    floatText(cx, cy - 98, `+${formatScore(result.total)}`, '#ff6b35', 17);
+  }, [player, level]);
 
   // ── GESTURE HANDLER ────────────────────────────────────────────────────────
-  const handleGesture = useCallback((dir: SwipeDirection, isHold: boolean) => {
-    const gs = gsRef.current;
-    if (!gs.running || gs.phase !== 'running') return;
-    if (gs.awaitingTap) return;
+  const onGesture = useCallback((dir: SwipeDirection, hold: boolean) => {
+    const g = gs.current;
+    if (!g.running) return;
+    if (g.phase === 'bail_anim') return;   // can't input during bail animation
+    if (g.tapOpen) return;                 // already mid-trick
 
-    const trick = getGestureToTrick(dir, isHold);
+    const trick = trickFor(dir, hold);
     if (!trick) return;
 
-    if (dir === 'up' || (!isHold && (dir === 'left' || dir === 'right'))) {
-      // Air trick
-      if (!gs.onGround && gs.trickPhase !== 'none') return;
-      gs.skaterVY = JUMP_FORCE - (player.stats.pop * 0.3);
-      gs.onGround = false;
-      gs.trickPhase = 'airborne';
-      gs.currentTrickId = trick.id;
-      gs.boardRotation = 0;
-      gs.airTime = 0;
-
-      const dur = 600 + trick.difficulty * 80;
-      gs.tapWindowStart = Date.now();
-      gs.tapWindowDuration = dur;
-      gs.awaitingTap = true;
-      gs.tapProgress = 0;
-
-    } else if (dir === 'down' && !isHold) {
-      // Manual
-      if (!gs.onGround) return;
-      gs.trickPhase = 'manual';
-      gs.currentTrickId = trick.id;
-      gs.manualBalance = 0;
-      gs.manualFrames = 0;
-      gs.awaitingTap = false;
-
-      const canvas = canvasRef.current;
-      const w = canvas?.width ?? 375, h = canvas?.height ?? 812;
-      const cx = w * SKATER_X, cy = h * GROUND_Y_RATIO;
-      spawnFloatText(cx, cy - 50, 'MANUAL', '#fff', 20);
-
-      // Auto end manual after duration
-      setTimeout(() => {
-        if (gsRef.current.trickPhase === 'manual') {
-          const bal = Math.abs(gsRef.current.manualBalance);
-          const acc = bal < 0.4 ? 0.9 : bal < 0.7 ? 0.6 : 0.2;
-          const canvas2 = canvasRef.current;
-          landTrick(trick.id, acc, canvas2?.width ?? 375, canvas2?.height ?? 812);
-        }
-      }, 1200 + player.stats.balance * 200);
-
-    } else if (isHold) {
-      // Grind — find nearest upcoming obstacle
-      const obs = obstaclesRef.current;
-      const canvas = canvasRef.current;
-      const w = canvas?.width ?? 375;
-      const skaterScreenX = w * SKATER_X;
-      const nearIdx = obs.findIndex(o => {
-        const screenX = o.worldX - gs.worldOffset;
-        return !o.passed && o.grindable && screenX > skaterScreenX - 30 && screenX < skaterScreenX + 80;
-      });
-      if (nearIdx < 0) return;
-      const target = obs[nearIdx];
-      gs.trickPhase = 'grind';
-      gs.currentTrickId = trick.id;
-      gs.grindObstacleIdx = nearIdx;
-      gs.grindProgress = 0;
-      gs.skaterY = target.height + 2;
-      gs.skaterVY = 0;
-      gs.onGround = false;
-      gs.awaitingTap = false;
-      gs.grindSparkTimer = 1;
-
-      const canvas2 = canvasRef.current;
-      const h = canvas2?.height ?? 812;
-      const cx = w * SKATER_X, cy = h * GROUND_Y_RATIO - target.height;
-      spawnFloatText(cx, cy - 30, trick.name, '#FFD700', 20);
-    }
-  }, [availableTricks, player]);
-
-  const handleTap = useCallback((accuracy: number) => {
-    const gs = gsRef.current;
-    if (!gs.awaitingTap || !gs.currentTrickId) return;
     const canvas = canvasRef.current;
-    landTrick(gs.currentTrickId, accuracy, canvas?.width ?? 375, canvas?.height ?? 812);
-  }, []);
+    const W = canvas?.offsetWidth ?? 375, H = canvas?.offsetHeight ?? 812;
+    const GY = H * GROUND_RATIO;
+    const cx = W * SKATER_FRAC;
 
-  // ── TOUCH HANDLING ─────────────────────────────────────────────────────────
+    // ── OLLIE / FLIP (air tricks) ─────────────────────────────────────────
+    if ((dir === 'up' || dir === 'left' || dir === 'right') && !hold) {
+      if (!g.onGround && g.phase === 'airborne') return; // already in air trick
+      g.skaterVY = JUMP_VY - player.stats.pop * 0.28;
+      g.onGround = false;
+      g.phase = 'airborne';
+      g.currentTrick = trick.id;
+      g.boardRot = 0; g.bodyTilt = 0; g.airFrames = 0;
+      g.tapOpen = true;
+      g.tapStart = Date.now();
+      g.tapProgress = 0;
+      return;
+    }
+
+    // ── MANUAL ────────────────────────────────────────────────────────────
+    if (dir === 'down' && !hold) {
+      if (!g.onGround) return;
+      g.phase = 'manual';
+      g.currentTrick = trick.id;
+      g.manualBalance = 0; g.manualFrames = 0;
+      floatText(cx, GY - g.skaterY - 55, 'MANUAL', '#ffffff', 22);
+      // Auto-end after balance-scaled duration
+      const dur = 1100 + player.stats.balance * 180;
+      setTimeout(() => {
+        if (gs.current.phase !== 'manual') return;
+        const bal = Math.abs(gs.current.manualBalance);
+        // Score the manual
+        const manTrick = ALL_TRICKS.find(t => t.id === trick.id)!;
+        const manQuality: TrickResult['landingQuality'] = bal < 0.5 ? 'clean' : bal < 0.75 ? 'sloppy' : 'bail';
+        const g2 = gs.current;
+        const result = calculateTrickScore(manTrick, manQuality, {
+          score: g2.score, combo: g2.combo, multiplier: g2.multiplier,
+          trickHistory: g2.trickHistory, isComboActive: g2.combo > 0,
+          runTimeLeft: g2.timeLeft, isRunning: g2.running, bails: g2.bails,
+          currentObstacleIndex: -1, manualActive: true, grindActive: false,
+          grindProgress: 0, playerX: g2.worldOffset, phase: 'skating',
+          lastTrickId: g2.lastTrickId, consecutiveSameTrick: g2.consecutiveSame,
+        }, player, level.multiplier);
+        g2.score += result.total;
+        g2.combo++; g2.multiplier = getNextMultiplier(g2.multiplier, result.landingQuality, player);
+        g2.trickHistory.push(result);
+        g2.phase = 'rolling'; g2.skaterY = 0;
+        floatText(cx, GY - 70, 'MANUAL DONE', '#00ff88', 18);
+        floatText(cx, GY - 92, `+${formatScore(result.total)}`, '#ff6b35', 15);
+      }, dur);
+      return;
+    }
+
+    // ── GRIND ─────────────────────────────────────────────────────────────
+    if (hold) {
+      const obs = obstacles.current;
+      const skSX = W * SKATER_FRAC;
+      const nearIdx = obs.findIndex(o => {
+        const sx = o.worldX - g.worldOffset;
+        return o.grindable && sx > skSX - 40 && sx < skSX + 100;
+      });
+      if (nearIdx < 0) return; // no obstacle in range
+      const ob = obs[nearIdx];
+      g.phase = 'grinding';
+      g.currentTrick = trick.id;
+      g.grindIdx = nearIdx;
+      g.grindFrames = 0;
+      g.sparkTimer = 0;
+      g.skaterY = ob.h + 4;
+      g.skaterVY = 0;
+      g.onGround = false;
+      floatText(cx, GY - ob.h - 50, trick.name.toUpperCase(), '#FFD700', 20);
+    }
+  }, [tricks, player, level]);
+
+  // ── TAP HANDLER ────────────────────────────────────────────────────────────
+  const onTap = useCallback(() => {
+    const g = gs.current;
+    if (!g.tapOpen || !g.currentTrick) return;
+    doLand(g.currentTrick, g.tapProgress);
+  }, [doLand]);
+
+  // ── TOUCH EVENTS ──────────────────────────────────────────────────────────
   const onTouchStart = useCallback((e: React.TouchEvent) => {
     const t = e.touches[0];
-    touchRef.current = { startX: t.clientX, startY: t.clientY, startTime: Date.now(), moved: false };
-    holdTimerRef.current = setTimeout(() => {
-      if (touchRef.current && !touchRef.current.moved) {
-        handleGesture('up', true);
-      }
+    touch.current = { x: t.clientX, y: t.clientY, t: Date.now(), moved: false };
+    holdTimer.current = setTimeout(() => {
+      if (touch.current && !touch.current.moved) onGesture('up', true);
     }, 260);
-  }, [handleGesture]);
+  }, [onGesture]);
 
   const onTouchMove = useCallback((e: React.TouchEvent) => {
-    if (!touchRef.current) return;
+    if (!touch.current) return;
     const t = e.touches[0];
-    const dx = t.clientX - touchRef.current.startX;
-    const dy = t.clientY - touchRef.current.startY;
-    if (Math.sqrt(dx * dx + dy * dy) > 10) touchRef.current.moved = true;
+    const d = Math.hypot(t.clientX - touch.current.x, t.clientY - touch.current.y);
+    if (d > 10) touch.current.moved = true;
   }, []);
 
   const onTouchEnd = useCallback((e: React.TouchEvent) => {
-    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
-    if (!touchRef.current) return;
+    if (holdTimer.current) clearTimeout(holdTimer.current);
+    if (!touch.current) return;
     const t = e.changedTouches[0];
-    const dx = t.clientX - touchRef.current.startX;
-    const dy = t.clientY - touchRef.current.startY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const elapsed = Date.now() - touchRef.current.startTime;
+    const dx = t.clientX - touch.current.x, dy = t.clientY - touch.current.y;
+    const dist = Math.hypot(dx, dy);
+    touch.current = null;
 
-    if (dist < 18 && elapsed < 280) {
-      // TAP
-      const gs = gsRef.current;
-      if (gs.awaitingTap && gs.currentTrickId) {
-        const prog = gs.tapProgress;
-        // accuracy: best near 0.3 (early-mid), worst at 1.0
-        const accuracy = Math.max(0, 1 - Math.abs(prog - 0.3) * 1.6);
-        handleTap(accuracy);
-      }
-    } else if (dist >= 35) {
-      const absX = Math.abs(dx), absY = Math.abs(dy);
-      const dir: SwipeDirection = absY > absX ? (dy < 0 ? 'up' : 'down') : (dx > 0 ? 'right' : 'left');
-      handleGesture(dir, false);
+    if (dist < 18) {
+      onTap();
+    } else if (dist >= 32) {
+      const dir: SwipeDirection = Math.abs(dy) > Math.abs(dx)
+        ? (dy < 0 ? 'up' : 'down')
+        : (dx > 0 ? 'right' : 'left');
+      onGesture(dir, false);
     }
-    touchRef.current = null;
-  }, [handleGesture, handleTap]);
+  }, [onTap, onGesture]);
 
-  // ── GAME LOOP ──────────────────────────────────────────────────────────────
+  // ── START RUN ─────────────────────────────────────────────────────────────
   const startRun = useCallback(() => {
-    gsRef.current = makeInitialGS();
-    gsRef.current.running = true;
-    gsRef.current.phase = 'running';
-    obstaclesRef.current = makeObstacles(level);
-    particlesRef.current = [];
-    floatTextsRef.current = [];
+    gs.current = makeGS();
+    gs.current.running = true;
+    obstacles.current = makeObstacles(level);
+    particles.current = [];
+    floats.current = [];
     finishedRef.current = false;
-    setPhase('running');
+    setScreenPhase('running');
 
-    timerRef.current = setInterval(() => {
-      const gs = gsRef.current;
-      if (gs.timeLeft <= 1) {
-        clearInterval(timerRef.current!);
-        gs.running = false;
-        gs.phase = 'finished';
-        gs.timeLeft = 0;
+    timer.current = setInterval(() => {
+      const g = gs.current;
+      if (!g.running) return;
+      if (g.timeLeft <= 1) {
+        clearInterval(timer.current!);
+        g.running = false;
         if (!finishedRef.current) {
           finishedRef.current = true;
-          setPhase('finished');
-          setTimeout(() => onComplete(gs.score, gs.trickHistory), 1400);
+          setScreenPhase('finished');
+          setTimeout(() => onComplete(g.score, g.trickHistory), 1200);
         }
-      } else {
-        gs.timeLeft--;
-      }
+      } else { g.timeLeft--; }
     }, 1000);
   }, [level, onComplete]);
 
-  // ── RAF GAME LOOP ──────────────────────────────────────────────────────────
+  // ── RAF LOOP ──────────────────────────────────────────────────────────────
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
 
     const resize = () => {
-      canvas.width = canvas.offsetWidth * window.devicePixelRatio;
-      canvas.height = canvas.offsetHeight * window.devicePixelRatio;
-      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = canvas.offsetWidth  * dpr;
+      canvas.height = canvas.offsetHeight * dpr;
+      ctx.scale(dpr, dpr);
     };
     resize();
     window.addEventListener('resize', resize);
 
     const loop = () => {
-      const w = canvas.offsetWidth, h = canvas.offsetHeight;
-      const gs = gsRef.current;
-      const obs = obstaclesRef.current;
+      const W = canvas.offsetWidth, H = canvas.offsetHeight;
+      const GY = H * GROUND_RATIO;
+      const g = gs.current;
+      const obs = obstacles.current;
 
-      // ── PHYSICS UPDATE ─────────────────────────────────────────────────────
-      if (gs.running) {
-        gs.frameCount++;
-        gs.worldOffset += SCROLL_SPEED + (player.stats.speed * 0.08);
-        gs.walkFrame++;
+      // ── UPDATE ─────────────────────────────────────────────────────────
+      if (g.running) {
+        g.frameCount++;
+        const spd = BASE_SCROLL + player.stats.speed * 0.07;
+        g.worldOffset += spd;
+        g.walkFrame++;
 
-        // Gravity
-        if (!gs.onGround || gs.skaterY > 0) {
-          gs.skaterVY += GRAVITY;
-          gs.skaterY -= gs.skaterVY;
-          if (gs.skaterY <= 0) {
-            gs.skaterY = 0; gs.skaterVY = 0; gs.onGround = true;
-            if (gs.trickPhase === 'airborne' && gs.currentTrickId && !gs.awaitingTap) {
-              // missed tap = auto bail
-              landTrick(gs.currentTrickId, 0.1, w, h);
+        // Gravity / landing
+        if (!g.onGround || g.skaterY > 0) {
+          g.skaterVY += GRAVITY;
+          g.skaterY  -= g.skaterVY;
+          if (g.skaterY <= 0 && g.phase !== 'grinding') {
+            g.skaterY = 0; g.skaterVY = 0; g.onGround = true;
+            // If airborne trick with open tap window, auto-resolve as bail
+            if (g.phase === 'airborne' && g.tapOpen && g.currentTrick) {
+              doLand(g.currentTrick, 1.0); // guaranteed bail zone
             }
           }
         }
 
-        // Board rotation during air tricks
-        if (gs.trickPhase === 'airborne') {
-          gs.airTime++;
-          const trick = ALL_TRICKS.find(t => t.id === gs.currentTrickId);
-          if (trick) {
-            if (trick.category === 'flip') {
-              gs.boardRotation += TRICK_ROTATION_SPEED;
-              if (trick.id === 'heelflip' || trick.id === 'inward-heel') gs.boardRotation -= TRICK_ROTATION_SPEED * 2;
-            } else if (trick.category === 'ollie') {
-              gs.bodyRotation += 2;
+        // Board spin during air tricks
+        if (g.phase === 'airborne') {
+          g.airFrames++;
+          const trick = ALL_TRICKS.find(t => t.id === g.currentTrick);
+          if (trick?.category === 'flip') {
+            // kickflip = positive spin, heelflip = negative
+            const dir = (trick.id === 'heelflip' || trick.id === 'inward-heel') ? -1 : 1;
+            g.boardRot += FLIP_RPM * dir;
+          } else if (trick?.category === 'ollie') {
+            g.bodyTilt += 1.5; // slight lean in ollie
+          }
+        }
+
+        // Landing window progress
+        if (g.tapOpen) {
+          g.tapProgress = Math.min((Date.now() - g.tapStart) / TAP_WINDOW_MS, 1);
+          if (g.tapProgress >= 1 && g.currentTrick) {
+            doLand(g.currentTrick, 1.0); // auto-bail on timeout
+          }
+        }
+
+        // Bail animation countdown → auto-recover
+        if (g.phase === 'bail_anim') {
+          g.bailFrames--;
+          g.boardRot += 3;
+          if (g.bailFrames <= 0 && g.bails < MAX_BAILS) {
+            g.phase = 'rolling';
+            g.skaterY = 0; g.skaterVY = 0; g.onGround = true;
+            g.boardRot = 0; g.bodyTilt = 0;
+          }
+        }
+
+        // Grind update
+        if (g.phase === 'grinding' && g.grindIdx >= 0) {
+          const ob = obs[g.grindIdx];
+          if (ob) {
+            const osx = ob.worldX - g.worldOffset;
+            g.skaterY = ob.h + 4;
+            g.grindFrames++;
+
+            // Sparks every 3 frames
+            g.sparkTimer++;
+            if (g.sparkTimer % 3 === 0) {
+              emitSparks(W * SKATER_FRAC, GY - g.skaterY);
+            }
+
+            // Trickle score while grinding
+            if (!ob.scored && g.grindFrames % 8 === 0) {
+              const pts = Math.round(GRIND_PTS_TICK * GRIND_MULT * g.multiplier * level.multiplier);
+              g.score += pts;
+            }
+
+            // Obstacle fully passed → end grind cleanly
+            if (osx + ob.w < W * SKATER_FRAC - 10) {
+              const grindTrick = ALL_TRICKS.find(t => t.id === g.currentTrick);
+              if (grindTrick) {
+                const result = calculateTrickScore(grindTrick, 'clean', {
+                  score: g.score, combo: g.combo, multiplier: g.multiplier,
+                  trickHistory: g.trickHistory, isComboActive: g.combo > 0,
+                  runTimeLeft: g.timeLeft, isRunning: g.running, bails: g.bails,
+                  currentObstacleIndex: g.grindIdx, manualActive: false,
+                  grindActive: true, grindProgress: 1,
+                  playerX: g.worldOffset, phase: 'skating',
+                  lastTrickId: g.lastTrickId, consecutiveSameTrick: g.consecutiveSame,
+                }, player, level.multiplier);
+                g.score += result.total;
+                g.combo++; g.multiplier = getNextMultiplier(g.multiplier, 'clean', player);
+                g.trickHistory.push(result);
+                const cx2 = W * SKATER_FRAC;
+                floatText(cx2, GY - g.skaterY - 50, 'GRIND!', '#FFD700', 22);
+                floatText(cx2, GY - g.skaterY - 74, `+${formatScore(result.total)}`, '#ff6b35', 15);
+                g.shakeTTL = 5;
+              }
+              g.phase = 'rolling';
+              g.skaterY = 0; g.skaterVY = 0; g.onGround = true;
+              g.grindIdx = -1; g.boardRot = 0;
             }
           }
         }
 
-        // Tap window progress
-        if (gs.awaitingTap) {
-          gs.tapProgress = Math.min((Date.now() - gs.tapWindowStart) / gs.tapWindowDuration, 1);
-          if (gs.tapProgress >= 1) {
-            // auto land badly
-            if (gs.currentTrickId) landTrick(gs.currentTrickId, 0.1, w, h);
-          }
-        }
-
-        // Grind
-        if (gs.trickPhase === 'grind' && gs.grindObstacleIdx >= 0) {
-          const gObs = obs[gs.grindObstacleIdx];
-          if (gObs) {
-            const screenX = gObs.worldX - gs.worldOffset;
-            gs.grindProgress = 1 - (screenX / w);
-            gs.skaterY = gObs.height + 2;
-            gs.grindSparkTimer = (gs.grindSparkTimer + 1) % 3;
-            // spawn sparks
-            if (gs.grindSparkTimer === 0) {
-              const sparks = spawnGrindSparks(gs, w * SKATER_X, h * GROUND_Y_RATIO - gs.skaterY);
-              particlesRef.current.push(...sparks);
-            }
-            // End grind when obstacle passes
-            if (screenX < -gObs.width) {
-              const acc = 0.75 + Math.random() * 0.2;
-              landTrick(gs.currentTrickId!, acc, w, h);
-              gs.skaterY = 0;
-            }
-          }
-        }
-
-        // Manual drift
-        if (gs.trickPhase === 'manual') {
-          gs.manualFrames++;
-          gs.manualBalance += (Math.random() - 0.5) * 0.04;
-          gs.manualBalance = Math.max(-1, Math.min(1, gs.manualBalance));
+        // Manual balance drift
+        if (g.phase === 'manual') {
+          g.manualFrames++;
+          g.manualBalance += (Math.random() - 0.50) * 0.035;
+          g.manualBalance = Math.max(-1, Math.min(1, g.manualBalance));
         }
 
         // Screen shake decay
-        if (gs.shakeFrames > 0) {
-          gs.shakeX = (Math.random() - 0.5) * 5;
-          gs.shakeY = (Math.random() - 0.5) * 4;
-          gs.shakeFrames--;
-        } else { gs.shakeX = 0; gs.shakeY = 0; }
-
-        // Mark passed obstacles
-        obs.forEach(o => {
-          const sx = o.worldX - gs.worldOffset;
-          if (sx < -o.width - 20 && !o.passed) o.passed = true;
-        });
+        if (g.shakeTTL > 0) {
+          g.shakeX = (Math.random() - 0.5) * 5;
+          g.shakeY = (Math.random() - 0.5) * 4;
+          g.shakeTTL--;
+        } else { g.shakeX = 0; g.shakeY = 0; }
       }
 
-      // ── PARTICLES UPDATE ───────────────────────────────────────────────────
-      particlesRef.current = particlesRef.current
+      // Particles + floats
+      particles.current = particles.current
         .filter(p => p.life > 0)
-        .map(p => ({ ...p, x: p.x + p.vx, y: p.y + p.vy, vy: p.vy + 0.15, life: p.life - 1 }));
-
-      // Float texts update
-      floatTextsRef.current = floatTextsRef.current
+        .map(p => ({ ...p, x: p.x+p.vx, y: p.y+p.vy, vy: p.vy+0.14, life: p.life-1 }));
+      floats.current = floats.current
         .filter(f => f.life > 0)
-        .map(f => ({ ...f, y: f.y + f.vy, life: f.life - 1, alpha: f.life / f.maxLife }));
+        .map(f => ({ ...f, y: f.y+f.vy, life: f.life-1 }));
 
-      // ── DRAW ──────────────────────────────────────────────────────────────
+      // ── DRAW ───────────────────────────────────────────────────────────
       ctx.save();
-      ctx.translate(gs.shakeX, gs.shakeY);
+      ctx.translate(g.shakeX, g.shakeY);
 
-      const groundY = h * GROUND_Y_RATIO;
+      drawBg(ctx, W, H, level, g.worldOffset);
 
-      drawBackground(ctx, w, h, level, gs.worldOffset);
-
-      // obstacles
-      obs.forEach(o => {
-        const screenX = o.worldX - gs.worldOffset;
-        if (screenX > -o.width - 20 && screenX < w + 20) {
+      // Obstacles
+      obs.forEach(ob => {
+        const sx = ob.worldX - g.worldOffset;
+        if (sx > -ob.w - 30 && sx < W + 30) {
+          const isGrinding = g.phase === 'grinding' && obs.indexOf(ob) === g.grindIdx;
           ctx.save();
-          ctx.globalAlpha = o.passed ? 0.3 : 1;
-          drawObstacle(ctx, o, screenX, groundY, level);
+          ctx.globalAlpha = (ob.worldX + ob.w < g.worldOffset - 30) ? 0.25 : 1;
+          drawObstacle(ctx, ob, sx, GY, isGrinding);
           ctx.restore();
         }
       });
 
-      drawGround(ctx, w, h, level, gs.worldOffset);
+      drawGround(ctx, W, H, level, g.worldOffset);
 
-      // skater
-      const skaterScreenX = w * SKATER_X;
-      const skaterScreenY = groundY - gs.skaterY;
-      drawSkater(ctx, skaterScreenX, skaterScreenY, gs, level);
+      // Skater
+      drawSkater(ctx, W * SKATER_FRAC, GY - g.skaterY, g);
 
-      // particles
-      drawParticles(ctx, particlesRef.current);
-
-      // HUD
-      drawHUD(ctx, w, h, gs, level, floatTextsRef.current, gs.tapProgress, gs.awaitingTap);
+      drawParticles(ctx, particles.current);
+      drawHUD(ctx, W, H, g, floats.current, obs);
 
       ctx.restore();
-
-      rafRef.current = requestAnimationFrame(loop);
+      raf.current = requestAnimationFrame(loop);
     };
 
-    rafRef.current = requestAnimationFrame(loop);
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      window.removeEventListener('resize', resize);
-    };
-  }, [level, player]);
+    raf.current = requestAnimationFrame(loop);
+    return () => { cancelAnimationFrame(raf.current); window.removeEventListener('resize', resize); };
+  }, [level, player, doLand]);
 
-  useEffect(() => {
-    return () => { clearInterval(timerRef.current!); };
-  }, []);
+  useEffect(() => () => { clearInterval(timer.current!); }, []);
 
-  // ── FINISHED OVERLAY ──────────────────────────────────────────────────────
-  if (phase === 'finished') {
-    const gs = gsRef.current;
-    const grade = getLetterGrade(gs.score, level.multiplier);
-    const gradeColor = getGradeColor(grade);
+  // ── FINISHED ──────────────────────────────────────────────────────────────
+  if (screenPhase === 'finished') {
+    const g = gs.current;
+    const grade = getLetterGrade(g.score, level.multiplier);
+    const gc    = getGradeColor(grade);
     return (
-      <div style={{
-        height: '100dvh', background: '#0a0a0f', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center',
-        fontFamily: "'Bebas Neue', Impact, sans-serif", padding: 24, gap: 12,
-      }}>
-        <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 10, letterSpacing: 4, fontFamily: 'monospace' }}>
+      <div style={{ height:'100dvh', background:'#0a0a0f', display:'flex', flexDirection:'column',
+        alignItems:'center', justifyContent:'center', gap:12, padding:24,
+        fontFamily:"'Bebas Neue',Impact,sans-serif" }}>
+        <div style={{ color:'rgba(255,255,255,0.35)', fontSize:10, letterSpacing:4, fontFamily:'monospace' }}>
           {level.city.toUpperCase()} · {level.spotName.toUpperCase()}
         </div>
-        <div style={{ fontSize: 110, lineHeight: 1, color: gradeColor, filter: `drop-shadow(0 0 40px ${gradeColor}88)` }}>
-          {grade}
+        <div style={{ fontSize:100, lineHeight:1, color:gc, filter:`drop-shadow(0 0 36px ${gc}88)` }}>{grade}</div>
+        <div style={{ color:'#fff', fontSize:46 }}>{formatScore(g.score)}</div>
+        <div style={{ color:'rgba(255,255,255,0.4)', fontSize:12, fontFamily:'monospace', letterSpacing:2 }}>
+          {g.trickHistory.length} TRICKS · {g.bails} BAILS · MAX x{Math.max(...g.trickHistory.map(t=>t.multiplier),1).toFixed(1)}
         </div>
-        <div style={{ color: '#fff', fontSize: 48 }}>{formatScore(gs.score)}</div>
-        <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 12, fontFamily: 'monospace', letterSpacing: 2 }}>
-          {gs.trickHistory.length} TRICKS · {gs.bails} BAILS · MAX x{Math.max(...gs.trickHistory.map(t => t.multiplier), 1).toFixed(1)}
-        </div>
-        <div style={{ color: 'rgba(255,255,255,0.2)', fontSize: 10, fontFamily: 'monospace', letterSpacing: 2, marginTop: 8 }}>
+        <div style={{ color:'rgba(255,255,255,0.2)', fontSize:10, fontFamily:'monospace', letterSpacing:2, marginTop:8 }}>
           SAVING...
         </div>
       </div>
     );
   }
 
-  // ── IDLE / START SCREEN ───────────────────────────────────────────────────
+  // ── MAIN CANVAS RENDER ────────────────────────────────────────────────────
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100dvh', overflow: 'hidden', background: '#111' }}
-      onTouchStart={phase === 'running' ? onTouchStart : undefined}
-      onTouchMove={phase === 'running' ? onTouchMove : undefined}
-      onTouchEnd={phase === 'running' ? onTouchEnd : undefined}
+    <div style={{ position:'relative', width:'100%', height:'100dvh', overflow:'hidden', background:'#111',
+      touchAction:'none', userSelect:'none' }}
+      onTouchStart={screenPhase==='running' ? onTouchStart : undefined}
+      onTouchMove={screenPhase==='running' ? onTouchMove : undefined}
+      onTouchEnd={screenPhase==='running' ? onTouchEnd : undefined}
     >
-      <canvas
-        ref={canvasRef}
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
-      />
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0, width:'100%', height:'100%' }} />
 
-      {/* Back button always visible */}
+      {/* Back button */}
       <button onClick={onBack} style={{
-        position: 'absolute', top: 16, left: 16, zIndex: 20,
-        background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.2)',
-        borderRadius: 8, color: '#fff', fontSize: 18, width: 40, height: 40,
-        cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontFamily: 'sans-serif',
+        position:'absolute', top:16, left:16, zIndex:20,
+        background:'rgba(0,0,0,0.55)', border:'1px solid rgba(255,255,255,0.2)',
+        borderRadius:8, color:'#fff', fontSize:18, width:40, height:40,
+        cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center',
       }}>←</button>
 
-      {/* City name HUD (top left) */}
-      {phase === 'running' && (
-        <div style={{
-          position: 'absolute', top: 16, left: 64, zIndex: 10,
-          fontFamily: "'Bebas Neue', Impact, sans-serif",
-        }}>
-          <div style={{ color: '#fff', fontSize: 20, lineHeight: 1, textShadow: '0 1px 6px rgba(0,0,0,0.9)' }}>
+      {/* City label */}
+      {screenPhase === 'running' && (
+        <div style={{ position:'absolute', top:16, left:64, zIndex:10,
+          fontFamily:"'Bebas Neue',Impact,sans-serif", pointerEvents:'none' }}>
+          <div style={{ color:'#fff', fontSize:20, lineHeight:1, textShadow:'0 1px 6px rgba(0,0,0,0.9)' }}>
             {level.city}
           </div>
-          <div style={{ color: 'rgba(255,255,255,0.45)', fontSize: 8, fontFamily: 'monospace', letterSpacing: 2 }}>
+          <div style={{ color:'rgba(255,255,255,0.45)', fontSize:8, fontFamily:'monospace', letterSpacing:2 }}>
             {level.spotName.toUpperCase()}
           </div>
         </div>
       )}
 
       {/* START OVERLAY */}
-      {phase === 'idle' && (
-        <div style={{
-          position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.78)', zIndex: 30,
-          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-          gap: 14, padding: '24px',
-          fontFamily: "'Bebas Neue', Impact, sans-serif",
-        }}>
-          <div style={{ color: 'rgba(255,255,255,0.35)', fontSize: 10, letterSpacing: 4, fontFamily: 'monospace' }}>
-            {level.state} · {level.spotName}
+      {screenPhase === 'idle' && (
+        <div style={{ position:'absolute', inset:0, background:'rgba(0,0,0,0.80)', zIndex:30,
+          display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center',
+          gap:14, padding:24, fontFamily:"'Bebas Neue',Impact,sans-serif" }}>
+
+          <div style={{ color:'rgba(255,255,255,0.35)', fontSize:10, letterSpacing:4, fontFamily:'monospace' }}>
+            {level.state} · {level.spotName.toUpperCase()}
           </div>
-          <div style={{ fontSize: 56, color: '#fff', lineHeight: 1 }}>{level.city}</div>
-          <div style={{
-            color: 'rgba(255,255,255,0.45)', fontSize: 11, fontFamily: 'monospace',
-            textAlign: 'center', maxWidth: 260, lineHeight: 1.6, letterSpacing: 0.5,
-          }}>
+          <div style={{ fontSize:54, color:'#fff', lineHeight:1 }}>{level.city}</div>
+          <div style={{ color:'rgba(255,255,255,0.45)', fontSize:11, fontFamily:'monospace',
+            textAlign:'center', maxWidth:270, lineHeight:1.6 }}>
             {level.description}
           </div>
 
-          <div style={{
-            background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
-            borderRadius: 12, padding: '14px 18px', width: '100%', maxWidth: 300,
-            display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '7px 12px',
-          }}>
+          {/* How to play */}
+          <div style={{ background:'rgba(255,255,255,0.05)', border:'1px solid rgba(255,255,255,0.1)',
+            borderRadius:12, padding:'14px 18px', width:'100%', maxWidth:300,
+            display:'grid', gridTemplateColumns:'1fr 1fr', gap:'7px 10px' }}>
             {[
-              ['↑ Swipe Up', 'Ollie / Air Trick'],
-              ['↓ Swipe Down', 'Manual'],
-              ['← Swipe Left', 'Kickflip'],
-              ['→ Swipe Right', 'Heelflip'],
-              ['Hold on obstacle', 'Grind'],
-              ['Tap (in air)', 'Land trick'],
-            ].map(([g, n]) => (
-              <div key={g} style={{ display: 'flex', gap: 6 }}>
-                <span style={{ color: '#ff6b35', fontSize: 9, fontFamily: 'monospace', minWidth: 80 }}>{g}</span>
-                <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 9, fontFamily: 'monospace' }}>{n}</span>
+              ['↑ Swipe Up','Ollie'],['← Swipe Left','Kickflip'],
+              ['→ Swipe Right','Heelflip'],['↓ Swipe Down','Manual'],
+              ['Hold near rail','Grind'],['Tap (GREEN zone)','Clean land'],
+            ].map(([g2, n]) => (
+              <div key={g2} style={{ display:'flex', gap:5 }}>
+                <span style={{ color:'#ff6b35', fontSize:9, fontFamily:'monospace', minWidth:80 }}>{g2}</span>
+                <span style={{ color:'rgba(255,255,255,0.4)', fontSize:9, fontFamily:'monospace' }}>{n}</span>
               </div>
             ))}
           </div>
 
+          {/* Bail rules */}
+          <div style={{ background:'rgba(255,60,60,0.08)', border:'1px solid rgba(255,60,60,0.2)',
+            borderRadius:8, padding:'10px 16px', width:'100%', maxWidth:300 }}>
+            <div style={{ color:'#ff8866', fontSize:12, letterSpacing:2, textAlign:'center', marginBottom:4 }}>
+              BAIL RULES
+            </div>
+            <div style={{ color:'rgba(255,255,255,0.5)', fontSize:9, fontFamily:'monospace',
+              textAlign:'center', lineHeight:1.7 }}>
+              Miss the tap window = BAIL<br/>
+              3 bails = RUN OVER<br/>
+              Bail breaks your combo<br/>
+              You auto get up and keep skating
+            </div>
+          </div>
+
           <button onClick={startRun} style={{
-            background: 'linear-gradient(135deg, #ff6b35, #f7c59f)',
-            border: 'none', borderRadius: 10, color: '#fff',
-            fontSize: 26, letterSpacing: 4, padding: '18px 52px',
-            fontFamily: "'Bebas Neue', Impact, sans-serif",
-            cursor: 'pointer', marginTop: 6,
-            boxShadow: '0 4px 28px rgba(255,107,53,0.55)',
+            background:'linear-gradient(135deg,#ff6b35,#f7c59f)',
+            border:'none', borderRadius:10, color:'#fff',
+            fontSize:26, letterSpacing:4, padding:'18px 52px',
+            fontFamily:"'Bebas Neue',Impact,sans-serif",
+            cursor:'pointer', marginTop:4,
+            boxShadow:'0 4px 28px rgba(255,107,53,0.55)',
           }}>
             DROP IN →
           </button>
