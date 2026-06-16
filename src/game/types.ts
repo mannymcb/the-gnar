@@ -94,9 +94,14 @@ export interface Rival {
   nickname: string;
   score: number;
   avatar: string;
+  // Singular (cities.ts + current screens)
   taunt: string;
   defeatLine: string;
   lossLine: string;
+  // Plural — optional, satisfies old levels.ts still in some repos
+  taunts?: string[];
+  defeats?: string[];
+  lossLines?: string[];
 }
 
 // ─── COLLECTIBLE ─────────────────────────────────────────────────────────────
